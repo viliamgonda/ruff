@@ -272,21 +272,12 @@ impl Ranged for AnyParameter<'_> {
 
 impl<'a> crate::Parameters<'a> {
     pub fn iter_source_order(self) -> impl Iterator<Item = AnyParameter<'a>> {
-        let mut ordinary = self
-            .posonlyargs()
-            .iter()
-            .chain(self.args())
-            .chain(self.kwonlyargs())
-            .peekable();
-        let mut variadics = [self.vararg(), self.kwarg()];
-        variadics.sort_by_key(|param| param.map_or(u32::MAX, |node| u32::from(node.start())));
-        let mut variadics = variadics.into_iter().flatten().peekable();
-        std::iter::from_fn(move || match (ordinary.peek(), variadics.peek()) {
-            (Some(first), Some(variadic)) if variadic.start() < first.start() => {
-                variadics.next().map(AnyParameter::Variadic)
+        self.ordered_items().iter().map(|node| {
+            if let Some(parameter) = node.cast::<crate::Parameter>() {
+                AnyParameter::Variadic(parameter)
+            } else {
+                AnyParameter::NonVariadic(node.retype())
             }
-            (Some(_), _) => ordinary.next().map(AnyParameter::NonVariadic),
-            (None, _) => variadics.next().map(AnyParameter::Variadic),
         })
     }
 
@@ -318,23 +309,11 @@ impl<'a> crate::Parameters<'a> {
     }
 
     pub fn len(self) -> usize {
-        if self.has_only_regular_args() {
-            return self.args().len();
-        }
-        self.posonlyargs().len()
-            + self.args().len()
-            + self.kwonlyargs().len()
-            + usize::from(self.vararg().is_some())
-            + usize::from(self.kwarg().is_some())
+        self.ordered_items().len()
     }
 
     pub fn is_empty(self) -> bool {
-        self.args().is_empty()
-            && (self.has_only_regular_args()
-                || (self.posonlyargs().is_empty()
-                    && self.kwonlyargs().is_empty()
-                    && self.vararg().is_none()
-                    && self.kwarg().is_none()))
+        self.ordered_items().is_empty()
     }
 }
 

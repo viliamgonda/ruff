@@ -733,6 +733,26 @@ mod tests {
     }
 
     #[test]
+    fn parameter_count_includes_all_groups() {
+        for (source, count) in [
+            ("def f(): pass", 0),
+            ("def f(x, y=0): pass", 2),
+            ("def f(a, /, b, *args, c, **kw): pass", 5),
+            ("def f(*, x): pass", 1),
+            ("def f(**kw, x): pass", 2),
+        ] {
+            let parsed = parse_unchecked_source(source, PySourceType::Python);
+            let parameters = parsed
+                .root()
+                .descendants()
+                .find_map(AstNode::cast::<ruff_python_ast::Parameters>)
+                .expect("function has a parameter list");
+            assert_eq!(parameters.len(), count, "{source}");
+            assert_eq!(parameters.is_empty(), count == 0, "{source}");
+        }
+    }
+
+    #[test]
     fn recovered_dictionary_entry_includes_unpacking_operator() {
         let source = "match x:\n    case {**  # capture\n          rest} + 1: pass\n";
         let parsed = parse_unchecked_source(source, PySourceType::Python);

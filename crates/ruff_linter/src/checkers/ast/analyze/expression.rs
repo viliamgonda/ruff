@@ -551,10 +551,11 @@ pub(crate) fn expression(kind: ExprKind<'_>, checker: &Checker) {
             }
         }
         ExprKind::FString(f_string_expr) => {
-            let value = f_string_expr.value();
+            let fields = f_string_expr.fields();
+            let value = fields.value;
 
             if checker.is_rule_enabled(Rule::FStringMissingPlaceholders) {
-                pyflakes::rules::f_string_missing_placeholders(checker, f_string_expr);
+                pyflakes::rules::f_string_missing_placeholders(checker, &fields);
             }
             if checker.is_rule_enabled(Rule::ExplicitFStringTypeConversion) {
                 for f_string in value.f_strings() {
@@ -834,7 +835,8 @@ pub(crate) fn expression(kind: ExprKind<'_>, checker: &Checker) {
             }
         }
         ExprKind::StringLiteral(string_like) => {
-            let value = string_like.value();
+            let fields = string_like.fields();
+            let value = fields.value;
 
             if checker.is_rule_enabled(Rule::UnicodeKindPrefix) {
                 for string_part in value {
@@ -847,13 +849,14 @@ pub(crate) fn expression(kind: ExprKind<'_>, checker: &Checker) {
                 }
             }
             if checker.is_rule_enabled(Rule::HardcodedStringCharset) {
-                refurb::rules::hardcoded_string_charset_literal(checker, string_like);
+                refurb::rules::hardcoded_string_charset_literal(checker, &fields);
             }
         }
         ExprKind::If(if_exp) => {
-            let test = if_exp.test();
-            let body = if_exp.body();
-            let orelse = if_exp.orelse();
+            let fields = if_exp.fields();
+            let test = fields.test;
+            let body = fields.body;
+            let orelse = fields.orelse;
 
             if checker.is_rule_enabled(Rule::IfElseBlockInsteadOfDictGet) {
                 flake8_simplify::rules::if_exp_instead_of_dict_get(
@@ -876,7 +879,7 @@ pub(crate) fn expression(kind: ExprKind<'_>, checker: &Checker) {
                 refurb::rules::if_exp_instead_of_or_operator(checker, if_exp);
             }
             if checker.is_rule_enabled(Rule::UselessIfElse) {
-                ruff::rules::useless_if_else(checker, if_exp);
+                ruff::rules::useless_if_else(checker, &fields);
             }
             if checker.is_rule_enabled(Rule::SliceToRemovePrefixOrSuffix) {
                 refurb::rules::slice_to_remove_affix_expr(checker, if_exp);
@@ -937,9 +940,10 @@ pub(crate) fn expression(kind: ExprKind<'_>, checker: &Checker) {
             }
         }
         ExprKind::DictComp(dict_comp) => {
-            let key = dict_comp.key();
-            let value = dict_comp.value();
-            let generators = dict_comp.generators();
+            let fields = dict_comp.fields();
+            let key = fields.key;
+            let value = fields.value;
+            let generators = fields.generators;
 
             if checker.is_rule_enabled(Rule::UnnecessaryListIndexLookup) {
                 pylint::rules::unnecessary_list_index_lookup_comprehension(checker, &expr);
@@ -971,7 +975,7 @@ pub(crate) fn expression(kind: ExprKind<'_>, checker: &Checker) {
                 }
             }
             if checker.is_rule_enabled(Rule::StaticKeyDictComprehension) {
-                flake8_bugbear::rules::static_key_dict_comprehension(checker, dict_comp);
+                flake8_bugbear::rules::static_key_dict_comprehension(checker, &fields);
             }
         }
         ExprKind::Generator(generator) => {

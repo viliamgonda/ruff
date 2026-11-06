@@ -1,4 +1,4 @@
-//! Computes source edits for Python file renames.
+//! Computes source edits for Python module and package renames.
 //!
 //! ## Overview
 //!
@@ -80,9 +80,11 @@
 //!
 //! The above terms are used consistently throughout this module.
 
+use std::borrow::Cow;
+
 use crate::RangedValue;
 use rayon::prelude::*;
-use ruff_db::files::{File, FileRange, directory_listing};
+use ruff_db::files::{File, FileError, FileRange, directory_listing, system_path_to_file};
 use ruff_db::source::source_text;
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::statement_visitor::{self, StatementVisitor};
@@ -93,21 +95,24 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{
     Module, ModuleName, ModuleResolveMode, ResolverEnvironment, ResolverFile, file_to_module,
-    resolve_module_confident, resolve_real_module_confident, search_paths,
+    package_locations, resolve_module_confident, resolve_real_module_confident, search_paths,
 };
 use ty_project::{Db, parallel::ParallelIteratorExt};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_semantic::types::Type;
 use ty_python_semantic::{DefinitionResolution, HasType, SemanticModel};
 
-/// Computes source edits for a batch of Python file renames.
+/// Computes source edits for a batch of Python file and package directory renames.
 ///
 /// The following types of rename request are not yet supported:
 ///
-/// - A request that renames a directory
 /// - A request that changes a module parent (e.g., renaming `a.old` to `b.new` or `new`)
+/// - A request that moves a package directory to a different filesystem parent
 /// - A request that renames an `__init__.py` or `__init__.pyi` file
 /// - A request that changes the extension of a module (e.g., from `.py` to `.pyi`)
+/// - A request that renames one directory of a namespace package spread across multiple search
+///   paths
+/// - Requests in a batch that give a package and another module the same new import name
 ///
 /// When a rename batch contains both supported and unsupported requests, the unsupported requests
 /// are skipped while the supported ones produce edits as normal.
@@ -167,10 +172,10 @@ pub fn will_rename_files(db: &dyn Db, renames: &[FileRename]) -> Vec<FileRenameE
         .collect()
 }
 
-/// One Python file rename in a batch.
+/// One file or directory rename in a batch.
 pub struct FileRename {
-    /// The source file before the rename.
-    pub file: File,
+    /// The source path before the rename.
+    pub old_path: SystemPathBuf,
     /// The destination path, which need not exist yet.
     pub new_path: SystemPathBuf,
 }
@@ -178,56 +183,127 @@ pub struct FileRename {
 /// A replacement and the file range containing it.
 pub type FileRenameEdit = RangedValue<String>;
 
-/// Maps old module names to new module names for supported file renames.
+/// Maps old module names to new module names for supported renames.
 struct ModuleNameChanges<'db> {
-    // A map from old module name to new module name for supported rename operations.
-    module_renames: FxHashMap<&'db ModuleName, ModuleName>,
-    // Last components of the old module names, e.g., `old` in `pkg.old`.
-    // Used to filter out irrelevant files and identifiers before semantic analysis.
-    old_module_last_components: FxHashSet<&'db str>,
+    /// Tracks old and new names for each individual file in the rename batch.
+    file_renames: FxHashMap<&'db ModuleName, ModuleName>,
+    /// Tracks old and new name information for each directory in the rename batch.
+    package_renames: FxHashMap<&'db ModuleName, PackageRename>,
+    // The old name components that change across the batch. Renaming `app/tools/old.py` to
+    // `app/tools/new.py` and `app/legacy/util/` to `app/legacy/shared/` records `old` and `util`.
+    // The directory rename contributes `util` to match names such as `app.legacy.util.helpers`.
+    renamed_module_name_components: FxHashSet<&'db str>,
     // Text matchers used to skip source files that cannot contain these components.
-    old_module_last_component_matchers: Vec<NameMatcher<'db>>,
+    renamed_component_matchers: Vec<NameMatcher<'db>>,
 }
 
 impl<'db> ModuleNameChanges<'db> {
     fn new(db: &'db dyn Db, renames: &[FileRename]) -> Self {
-        let module_renames: FxHashMap<_, _> = renames
-            .iter()
-            .filter_map(|rename| module_rename(db, rename))
-            .filter(|(old_module_name, new_module_name)| *old_module_name != new_module_name)
-            .collect();
-        let old_module_last_components: FxHashSet<&'db str> = module_renames
+        let (file_renames, package_renames) = validate_renames(db, renames);
+        let renamed_module_name_components: FxHashSet<&'db str> = file_renames
             .keys()
-            .map(|&old_module_name| old_module_name.last_component())
+            .chain(package_renames.keys())
+            .map(|name| name.last_component())
             .collect();
-        let old_module_last_component_matchers = old_module_last_components
+        let renamed_component_matchers = renamed_module_name_components
             .iter()
             .map(|&component| NameMatcher::new(component))
             .collect();
         Self {
-            module_renames,
-            old_module_last_components,
-            old_module_last_component_matchers,
+            file_renames,
+            package_renames,
+            renamed_module_name_components,
+            renamed_component_matchers,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.module_renames.is_empty()
+        self.file_renames.is_empty() && self.package_renames.is_empty()
     }
 
-    fn new_module_name(&self, old_module_name: &ModuleName) -> Option<&ModuleName> {
-        self.module_renames.get(old_module_name)
+    /// Returns the new name of a resolved module affected by this batch.
+    ///
+    /// A file rename replaces the full module name, such as `pkg.old` with `pkg.new`. It takes
+    /// precedence over any directory rename that matches a prefix of the same name.
+    ///
+    /// Otherwise, a matching directory rename replaces the package prefix and keeps the suffix
+    /// (e.g., renaming the package `pkg.old` to `pkg.new` changes `pkg.old.helpers` to
+    /// `pkg.new.helpers`).
+    fn new_module_name(
+        &self,
+        model: &SemanticModel<'db>,
+        module: Module<'db>,
+    ) -> Option<Cow<'_, ModuleName>> {
+        let name = module.name(model.db());
+        if let Some(new_name) = self.file_renames.get(name) {
+            return Some(Cow::Borrowed(new_name));
+        }
+        if self.package_renames.is_empty() {
+            return None;
+        }
+
+        // Walk from the full name toward its parents. Use the longest matching prefix whose
+        // renamed directory supplies the resolved module.
+        for prefix in name.ancestors() {
+            let Some(rename) = self.package_renames.get(&prefix) else {
+                continue;
+            };
+            if !rename.affects_module(model, module) {
+                continue;
+            }
+            let Some(suffix) = name.relative_to(&prefix) else {
+                return Some(Cow::Borrowed(&rename.new_prefix));
+            };
+            let mut new_name = rename.new_prefix.clone();
+            new_name.extend(&suffix);
+
+            return Some(Cow::Owned(new_name));
+        }
+
+        None
     }
 
-    fn is_old_module_last_component(&self, component: &str) -> bool {
-        self.old_module_last_components.contains(component)
+    fn is_renamed_component(&self, component: &str) -> bool {
+        self.renamed_module_name_components.contains(component)
     }
 
     /// Returns whether the source may need edits for these module name changes.
     fn may_affect_source(&self, source: &str) -> bool {
-        self.old_module_last_component_matchers
+        self.renamed_component_matchers
             .iter()
             .any(|matcher| matcher.may_match(source))
+    }
+}
+
+struct PackageRename {
+    old_directory: SystemPathBuf,
+    new_prefix: ModuleName,
+}
+
+impl PackageRename {
+    /// Returns whether the rename moves the runtime module, falling back to the typing module.
+    ///
+    /// A namespace package is affected only when all its directories move.
+    fn affects_module<'db>(&self, model: &SemanticModel<'db>, module: Module<'db>) -> bool {
+        let db = model.db();
+        let environment = model.program_file().resolver_environment(db);
+        let Some((module, mode)) = resolve_module_for_rename(db, environment, module.name(db))
+        else {
+            return false;
+        };
+
+        if let Some(file) = module.file(db) {
+            return file
+                .path(db)
+                .as_system_path()
+                .is_some_and(|path| path.starts_with(&self.old_directory));
+        }
+
+        package_locations(db, environment, module.name(db), mode).is_some_and(|locations| {
+            locations
+                .iter()
+                .all(|path| path.starts_with(&self.old_directory))
+        })
     }
 }
 
@@ -348,19 +424,7 @@ impl<'a, 'db> ImportStatementVisitor<'a, 'db> {
             return;
         };
 
-        let import_from_module_edit = if let Some(new_module_name) = self
-            .analyzer
-            .module_name_changes
-            .new_module_name(resolved_module.name(self.model.db()))
-        {
-            let Some(module) = statement.module.as_ref() else {
-                return;
-            };
-
-            Some(self.import_from_module_edit(module, new_module_name))
-        } else {
-            None
-        };
+        let import_from_module_edit = self.import_from_module_edit(statement, resolved_module);
 
         for alias in &statement.names {
             if let EditDecision::Yes(new_imported_name) = self
@@ -377,21 +441,33 @@ impl<'a, 'db> ImportStatementVisitor<'a, 'db> {
         }
     }
 
-    /// Constructs a module name edit, preserving its prefix and the import level.
-    ///
-    /// The module parent is unchanged, so only the last component needs replacing.
-    /// For example, `from ..pkg.old import C` becomes `from ..pkg.new import C`.
+    /// Constructs a module name edit while preserving the import level.
     fn import_from_module_edit(
         &self,
-        module: &ast::Identifier,
-        new_module_name: &ModuleName,
-    ) -> FileRenameEdit {
-        let replacement = if let Some((prefix, _)) = module.as_str().rsplit_once('.') {
-            format!("{prefix}.{}", new_module_name.last_component())
+        statement: &ast::StmtImportFrom,
+        resolved_module: Module<'db>,
+    ) -> Option<FileRenameEdit> {
+        let module = statement.module.as_ref()?;
+        let new_name = self
+            .analyzer
+            .module_name_changes
+            .new_module_name(self.model, resolved_module)?;
+        let replacement = if statement.level == 0 {
+            new_name.as_str()
         } else {
-            new_module_name.last_component().to_string()
+            // A same-parent rename preserves the depth of both modules. Any renamed component
+            // hidden by the leading dots moves with the importing file, so keep only the suffix
+            // that the original import spelled out.
+            let dots = module.as_str().matches('.').count();
+            new_name
+                .rmatch_indices('.')
+                .nth(dots)
+                .map(|(dot, _)| &new_name[dot + 1..])
+                .unwrap_or(new_name.as_str())
         };
-        self.source_edit(module.range, replacement)
+
+        (replacement != module.as_str())
+            .then(|| self.source_edit(module.range, replacement.to_string()))
     }
 
     /// Records an imported name edit and any resulting bound name change.
@@ -503,7 +579,7 @@ impl<'db> ImportAnalyzer<'db> {
 
         let Some(new_module_name) = self
             .module_name_changes
-            .new_module_name(resolved_module.name(model.db()))
+            .new_module_name(model, resolved_module)
         else {
             return EditDecision::No;
         };
@@ -523,7 +599,7 @@ impl<'db> ImportAnalyzer<'db> {
     ) -> EditDecision {
         if !self
             .module_name_changes
-            .is_old_module_last_component(alias.name.as_str())
+            .is_renamed_component(alias.name.as_str())
         {
             return EditDecision::No;
         }
@@ -533,7 +609,7 @@ impl<'db> ImportAnalyzer<'db> {
         {
             let Some(new_module_name) = self
                 .module_name_changes
-                .new_module_name(imported_module.name(model.db()))
+                .new_module_name(model, imported_module)
             else {
                 return EditDecision::No;
             };
@@ -857,7 +933,7 @@ impl<'a, 'db> ModuleReferenceVisitor<'a, 'db> {
         let Some(new_module_name) = self
             .analyzer
             .module_name_changes
-            .new_module_name(old_module_name)
+            .new_module_name(self.model, attribute_module)
         else {
             return;
         };
@@ -916,7 +992,7 @@ impl<'a, 'db> ModuleReferenceVisitor<'a, 'db> {
     /// Ordinary strings in `__all__ = ["old"]` or `importlib.import_module("pkg.old")`
     /// are left unchanged.
     fn edit_string_annotation_references(&mut self, string: &ast::ExprStringLiteral) {
-        // Skip strings that cannot mention the last component of an old module name before
+        // Skip strings that cannot mention a renamed component before
         // `SemanticModel::enter_string_annotation` queries the inferred types for the enclosing scope.
         if !self
             .analyzer
@@ -961,7 +1037,7 @@ impl<'a> SourceOrderVisitor<'a> for ModuleReferenceVisitor<'a, '_> {
                     && self
                         .analyzer
                         .module_name_changes
-                        .is_old_module_last_component(name.id.as_str()) =>
+                        .is_renamed_component(name.id.as_str()) =>
             {
                 self.edit_name_reference(name);
             }
@@ -969,7 +1045,7 @@ impl<'a> SourceOrderVisitor<'a> for ModuleReferenceVisitor<'a, '_> {
                 if self
                     .analyzer
                     .module_name_changes
-                    .is_old_module_last_component(attribute.attr.as_str()) =>
+                    .is_renamed_component(attribute.attr.as_str()) =>
             {
                 self.edit_attribute_reference(attribute);
             }
@@ -1045,15 +1121,78 @@ impl EditDecision {
     }
 }
 
+/// Returns the file and package name mappings for supported renames in a batch.
+fn validate_renames<'db>(
+    db: &'db dyn Db,
+    renames: &[FileRename],
+) -> (
+    FxHashMap<&'db ModuleName, ModuleName>,
+    FxHashMap<&'db ModuleName, PackageRename>,
+) {
+    let mut file_renames = FxHashMap::default();
+    let mut package_renames = FxHashMap::default();
+    let mut file_destinations = Vec::new();
+    let mut package_destinations = Vec::new();
+    let is_batch = renames.len() > 1;
+    let cwd = db.system().current_directory();
+
+    for rename in renames {
+        let old_path = SystemPath::absolute(&rename.old_path, cwd);
+        let new_path = SystemPath::absolute(&rename.new_path, cwd);
+        match system_path_to_file(db, &old_path) {
+            Ok(file) => {
+                if let Some((old, new)) = module_rename(db, file, &old_path, &new_path)
+                    && *old != new
+                {
+                    file_renames.insert(old, new);
+                    if is_batch {
+                        file_destinations.push(new_path);
+                    }
+                }
+            }
+            Err(FileError::IsADirectory) => {
+                let mappings = package_renames_for_paths(db, &old_path, &new_path);
+                if is_batch && !mappings.is_empty() {
+                    package_destinations.push(new_path.join("__init__.py"));
+                }
+                package_renames.extend(mappings);
+            }
+            Err(FileError::NotFound) => {}
+        }
+    }
+
+    if !package_destinations.is_empty() {
+        // Drop mappings that give a renamed package and another renamed module the same import
+        // name. Check every name a destination can have under the configured search roots. For
+        // example, with `/src` and `/` as search roots, `/src/new.py` can collide as `src.new`
+        // even if its rename rewrites imports to use `new`.
+        let mut destinations: FxHashSet<_> = file_destinations
+            .iter()
+            .flat_map(|path| destination_module_names(db, path))
+            .collect();
+        let conflicting_destinations: FxHashSet<_> = package_destinations
+            .iter()
+            .flat_map(|path| destination_module_names(db, path))
+            .filter(|name| !destinations.insert(name.clone()))
+            .collect();
+        if !conflicting_destinations.is_empty() {
+            file_renames.retain(|_, name| !conflicting_destinations.contains(name));
+            package_renames
+                .retain(|_, rename| !conflicting_destinations.contains(&rename.new_prefix));
+        }
+    }
+
+    (file_renames, package_renames)
+}
+
 /// Maps a supported file rename to its old and new module names.
 fn module_rename<'db>(
     db: &'db dyn Db,
-    rename: &FileRename,
+    file: File,
+    old_path: &SystemPath,
+    new_path: &SystemPath,
 ) -> Option<(&'db ModuleName, ModuleName)> {
     let resolver_environment = resolver_environment(db);
-    let file = rename.file;
-    let old_path = file.path(db).as_system_path()?;
-    let new_path = SystemPath::absolute(&rename.new_path, db.system().current_directory());
     let extension = old_path.extension()?;
 
     if !matches!(extension, "py" | "pyi")
@@ -1069,11 +1208,13 @@ fn module_rename<'db>(
 
     // A runtime module and its stub share a module name. Renaming only the stub
     // must not redirect imports while the runtime module remains at its old path.
-    if resolve_module_file(db, old_module_name)? != file {
+    let (resolved_module, _) =
+        resolve_module_for_rename(db, resolver_environment, old_module_name)?;
+    if resolved_module.file(db) != Some(file) {
         return None;
     }
 
-    let new_module_name = destination_module_name(db, &new_path)?;
+    let new_module_name = destination_module_name(db, new_path)?;
     if old_module_name.parent() != new_module_name.parent() {
         return None;
     }
@@ -1093,18 +1234,86 @@ fn module_rename<'db>(
     Some((old_module_name, new_module_name))
 }
 
-/// Derives a destination module name without requiring the destination to exist yet.
-fn destination_module_name(db: &dyn Db, path: &SystemPath) -> Option<ModuleName> {
-    search_paths(db, resolver_environment(db), ModuleResolveMode::Typing)
+/// Maps a package directory's import names to their new names on each search path.
+fn package_renames_for_paths<'db>(
+    db: &'db dyn Db,
+    old_directory: &SystemPath,
+    new_directory: &SystemPath,
+) -> Vec<(&'db ModuleName, PackageRename)> {
+    let Some((parent, new_basename)) = new_directory.parent().zip(new_directory.file_name()) else {
+        return Vec::new();
+    };
+    if old_directory.parent() != Some(parent)
+        || !directory_listing(db, parent)
+            .is_ok_and(|listing| listing.file_type(new_basename).is_none())
+    {
+        return Vec::new();
+    }
+
+    // A hypothetical initializer gives us the name of the package even in the absence of
+    // `__init__.py`. Confirm below that the resolver actually uses the directory for that name.
+    let old_init = old_directory.join("__init__.py");
+    let new_init = new_directory.join("__init__.py");
+    let environment = resolver_environment(db);
+
+    search_paths(db, environment, ModuleResolveMode::Typing)
         .filter(|search_path| !search_path.is_standard_library())
-        .find_map(|search_path| search_path.module_name_for_system_path(path))
+        .filter_map(|search_path| {
+            let old_name = search_path.module_name_for_system_path(&old_init)?;
+            let new_prefix = search_path.module_name_for_system_path(&new_init)?;
+            if old_directory.file_name() != Some(old_name.last_component())
+                || new_basename != new_prefix.last_component()
+                || resolve_module_confident(db, environment, &new_prefix).is_some()
+                || resolve_real_module_confident(db, environment, &new_prefix).is_some()
+            {
+                return None;
+            }
+
+            let (old_module, mode) = resolve_module_for_rename(db, environment, &old_name)?;
+            let locations = package_locations(db, environment, &old_name, mode)?;
+            if !matches!(locations.as_slice(), [location] if location.as_path() == old_directory) {
+                // Reject packages supplied by another directory or spread across search paths.
+                // Moving one portion of a namespace leaves its old name importable.
+                return None;
+            }
+
+            Some((
+                old_module.name(db),
+                PackageRename {
+                    old_directory: old_directory.to_path_buf(),
+                    new_prefix,
+                },
+            ))
+        })
+        .collect()
 }
 
-fn resolve_module_file(db: &dyn Db, module_name: &ModuleName) -> Option<File> {
-    let resolver_environment = resolver_environment(db);
+/// Derives a destination module name without requiring the destination to exist yet.
+fn destination_module_name(db: &dyn Db, path: &SystemPath) -> Option<ModuleName> {
+    destination_module_names(db, path).next()
+}
+
+fn destination_module_names<'a>(
+    db: &'a dyn Db,
+    path: &'a SystemPath,
+) -> impl Iterator<Item = ModuleName> + 'a {
+    search_paths(db, resolver_environment(db), ModuleResolveMode::Typing)
+        .filter(|search_path| !search_path.is_standard_library())
+        .filter_map(move |search_path| search_path.module_name_for_system_path(path))
+}
+
+/// Resolves a module for rename edits, falling back to typing when runtime resolution fails.
+fn resolve_module_for_rename<'db>(
+    db: &'db dyn ty_module_resolver::Db,
+    resolver_environment: ResolverEnvironment<'db>,
+    module_name: &ModuleName,
+) -> Option<(Module<'db>, ModuleResolveMode)> {
     resolve_real_module_confident(db, resolver_environment, module_name)
-        .or_else(|| resolve_module_confident(db, resolver_environment, module_name))?
-        .file(db)
+        .map(|module| (module, ModuleResolveMode::Runtime))
+        .or_else(|| {
+            resolve_module_confident(db, resolver_environment, module_name)
+                .map(|module| (module, ModuleResolveMode::Typing))
+        })
 }
 
 fn resolver_environment(db: &dyn Db) -> ResolverEnvironment<'_> {
@@ -1130,11 +1339,11 @@ mod tests {
     use ruff_db::diagnostic::{
         Annotation, Diagnostic, DiagnosticId, DisplayDiagnosticConfig, LintName, Severity,
     };
-    use ruff_db::files::system_path_to_file;
     use ruff_db::system::{DbWithTestSystem, DbWithWritableSystem, SystemVirtualPath};
     use ruff_python_ast::PythonVersion;
     use ruff_python_trivia::textwrap::dedent;
     use ruff_text_size::Ranged;
+    use ty_module_resolver::{FallibleStrategy, SearchPathSettings};
     use ty_project::{ProjectMetadata, TestDb};
 
     #[test]
@@ -1219,6 +1428,302 @@ mod tests {
         4 | print(C, old.C)
           |          --- new
         ");
+    }
+
+    #[test]
+    fn renames_a_regular_package_through_both_search_roots() {
+        let mut db = test_db(&[
+            ("/src/old/__init__.py", "from old.helpers import VALUE"),
+            ("/src/old/helpers.py", "VALUE = 1"),
+            (
+                "/use.py",
+                "
+                import old.helpers
+                import old as stable
+                import src.old.helpers
+                print(old.helpers.VALUE, stable.VALUE, src.old.helpers.VALUE)
+
+                def f(old):
+                    return old.helpers.VALUE
+                ",
+            ),
+        ]);
+        set_search_paths(
+            &mut db,
+            &SearchPathSettings::new(vec!["/src".into(), "/".into()]),
+        );
+
+        let renames = file_renames(&[("/src/old", "/src/new")]);
+        let edits = will_rename_files(&db, &renames);
+        assert_snapshot!(render_edits(&db, edits), @"
+        info[file-rename]: Rename edits (6)
+         --> src/old/__init__.py:1:6
+          |
+        1 | from old.helpers import VALUE
+          |      ----------- new.helpers
+          |
+         ::: use.py:2:8
+          |
+        2 | import old.helpers
+          |        ----------- new.helpers
+        3 | import old as stable
+          |        --- new
+        4 | import src.old.helpers
+          |        --------------- src.new.helpers
+        5 | print(old.helpers.VALUE, stable.VALUE, src.old.helpers.VALUE)
+          |       --- new                              --- new
+        6 |
+        7 | def f(old):
+        8 |     return old.helpers.VALUE
+          |
+        ");
+    }
+
+    #[test]
+    fn renames_a_runtime_package_with_separate_stubs() {
+        let mut db = test_db(&[
+            ("/stubs/old/__init__.pyi", ""),
+            ("/stubs/old/helpers.pyi", "VALUE: int"),
+            ("/stubs/old/only_types.pyi", ""),
+            ("/src/old/__init__.py", ""),
+            ("/src/old/helpers.py", "VALUE = 1"),
+            (
+                "/src/use.py",
+                "
+                from typing import TYPE_CHECKING
+
+                import old
+                import old.helpers
+                print(old.helpers.VALUE)
+
+                if TYPE_CHECKING:
+                    import old.only_types as typing_only
+                ",
+            ),
+        ]);
+        set_search_paths(
+            &mut db,
+            &SearchPathSettings::new(vec!["/stubs".into(), "/src".into()]),
+        );
+
+        let renames = file_renames(&[("/src/old", "/src/new")]);
+        let edits = will_rename_files(&db, &renames);
+
+        assert_snapshot!(render_edits(&db, edits), @"
+        info[file-rename]: Rename edits (3)
+         --> src/use.py:4:8
+          |
+        2 | from typing import TYPE_CHECKING
+        3 |
+        4 | import old
+          |        --- new
+        5 | import old.helpers
+          |        ----------- new.helpers
+        6 | print(old.helpers.VALUE)
+          |       --- new
+        7 |
+        8 | if TYPE_CHECKING:
+        9 |     import old.only_types as typing_only
+          |
+        ");
+    }
+
+    #[test]
+    fn renames_typing_only_descendants_of_a_package() {
+        let sources = &[
+            ("/old/only_types.pyi", "class C: ..."),
+            ("/use.py", "from old.only_types import C"),
+        ];
+
+        assert_snapshot!(rename_edits(&[("/old", "/new")], sources), @"
+        info[file-rename]: Rename edits (1)
+         --> use.py:1:6
+          |
+        1 | from old.only_types import C
+          |      -------------- new.only_types
+        ");
+    }
+
+    #[test]
+    fn renames_a_nested_namespace_and_preserves_relative_import_targets() {
+        let sources = &[
+            ("/outer/old/nested/helpers.py", "VALUE = 1"),
+            (
+                "/outer/old/use.py",
+                "
+                from . import nested
+                from .nested.helpers import VALUE
+                from ..old.nested.helpers import VALUE as value_from_parent
+                ",
+            ),
+            (
+                "/outer/use.py",
+                "
+                from . import old
+                from .old.nested.helpers import VALUE
+                print(old.nested.helpers.VALUE)
+                ",
+            ),
+            (
+                "/use.py",
+                "
+                import outer.old.nested.helpers
+                print(outer.old.nested.helpers.VALUE)
+                ",
+            ),
+        ];
+
+        assert_snapshot!(rename_edits(&[("/outer/old", "/outer/new")], sources), @"
+        info[file-rename]: Rename edits (6)
+         --> outer/old/use.py:4:8
+          |
+        2 | from . import nested
+        3 | from .nested.helpers import VALUE
+        4 | from ..old.nested.helpers import VALUE as value_from_parent
+          |        ------------------ new.nested.helpers
+          |
+         ::: outer/use.py:2:15
+          |
+        2 | from . import old
+          |               --- new
+        3 | from .old.nested.helpers import VALUE
+          |       ------------------ new.nested.helpers
+        4 | print(old.nested.helpers.VALUE)
+          |       --- new
+          |
+         ::: use.py:2:8
+          |
+        2 | import outer.old.nested.helpers
+          |        ------------------------ outer.new.nested.helpers
+        3 | print(outer.old.nested.helpers.VALUE)
+          |             --- new
+        ");
+    }
+
+    #[test]
+    fn omits_package_renames_with_a_shadowed_destination() {
+        assert_no_edits(
+            &[("/old", "/new")],
+            &[
+                ("/old/helpers.py", ""),
+                ("/new.py", ""),
+                ("/use.py", "import old.helpers"),
+            ],
+        );
+    }
+
+    #[test]
+    fn omits_stub_package_renames_when_the_runtime_package_stays() {
+        let mut db = test_db(&[
+            ("/stubs/old/__init__.pyi", ""),
+            ("/src/old/__init__.py", ""),
+            ("/src/use.py", "import old"),
+        ]);
+        set_search_paths(
+            &mut db,
+            &SearchPathSettings::new(vec!["/stubs".into(), "/src".into()]),
+        );
+
+        let renames = file_renames(&[("/stubs/old", "/stubs/new")]);
+        let edits = will_rename_files(&db, &renames);
+
+        assert_eq!(render_edits(&db, edits), "No edits");
+    }
+
+    #[test]
+    fn omits_stub_package_renames_when_the_runtime_target_is_a_file() {
+        let mut db = test_db(&[
+            ("/stubs/old/__init__.pyi", ""),
+            ("/src/old.py", ""),
+            ("/src/use.py", "import old"),
+        ]);
+        set_search_paths(
+            &mut db,
+            &SearchPathSettings::new(vec!["/stubs".into(), "/src".into()]),
+        );
+
+        let renames = file_renames(&[("/stubs/old", "/stubs/new")]);
+        let edits = will_rename_files(&db, &renames);
+
+        assert_eq!(render_edits(&db, edits), "No edits");
+    }
+
+    #[test]
+    fn omits_package_and_file_renames_with_a_shared_destination_name() {
+        let mut db = test_db(&[
+            ("/src/old_pkg/__init__.py", ""),
+            ("/other/old_file.py", ""),
+            ("/src/use.py", "import old_pkg, old_file"),
+        ]);
+        set_search_paths(
+            &mut db,
+            &SearchPathSettings::new(vec!["/src".into(), "/other".into()]),
+        );
+
+        let renames = file_renames(&[
+            ("/src/old_pkg", "/src/new"),
+            ("/other/old_file.py", "/other/new.py"),
+        ]);
+        let edits = will_rename_files(&db, &renames);
+
+        assert_eq!(render_edits(&db, edits), "No edits");
+    }
+
+    #[test]
+    fn omits_two_package_renames_with_a_shared_destination_name() {
+        let mut db = test_db(&[
+            ("/src/old_pkg/__init__.py", ""),
+            ("/other/other_pkg/__init__.py", ""),
+            ("/src/use.py", "import old_pkg, other_pkg"),
+        ]);
+        set_search_paths(
+            &mut db,
+            &SearchPathSettings::new(vec!["/src".into(), "/other".into()]),
+        );
+
+        let renames = file_renames(&[
+            ("/src/old_pkg", "/src/new"),
+            ("/other/other_pkg", "/other/new"),
+        ]);
+        let edits = will_rename_files(&db, &renames);
+
+        assert_eq!(render_edits(&db, edits), "No edits");
+    }
+
+    #[test]
+    fn omits_renames_with_a_shared_name_under_a_second_search_root() {
+        let mut db = test_db(&[
+            ("/src/old_ns/helper.py", ""),
+            ("/src/local_file.py", ""),
+            ("/src/use.py", "import src.old_ns.helper, local_file"),
+        ]);
+        set_search_paths(
+            &mut db,
+            &SearchPathSettings::new(vec!["/src".into(), "/".into()]),
+        );
+
+        let renames = file_renames(&[
+            ("/src/old_ns", "/src/new"),
+            ("/src/local_file.py", "/src/new.py"),
+        ]);
+        let edits = will_rename_files(&db, &renames);
+
+        assert_eq!(render_edits(&db, edits), "No edits");
+    }
+
+    #[test]
+    fn omits_renames_of_one_portion_of_a_namespace_package() {
+        let mut db = test_db(&[
+            ("/old/left.py", ""),
+            ("/extra/old/right.py", ""),
+            ("/use.py", "from old import left, right"),
+        ]);
+        let mut search_paths = SearchPathSettings::new(vec!["/".into()]);
+        search_paths.extra_paths = vec!["/extra".into()];
+        set_search_paths(&mut db, &search_paths);
+
+        let renames = file_renames(&[("/old", "/new")]);
+        assert!(will_rename_files(&db, &renames).is_empty());
     }
 
     #[test]
@@ -1307,7 +1812,7 @@ mod tests {
         db.project().open_file(&mut db, not_indexed);
         db.project().open_file(&mut db, virtual_file);
 
-        let rename = file_renames(&db, &[("/old.py", "/new.py")]);
+        let rename = file_renames(&[("/old.py", "/new.py")]);
         let edits = will_rename_files(&db, &rename);
         assert_snapshot!(render_edits(&db, edits), @"
         info[file-rename]: Rename edits (1)
@@ -1931,7 +2436,7 @@ mod tests {
     /// Computes rename edits and shows their ranges and replacements in the original sources.
     fn rename_edits(renames: &[(&str, &str)], sources: &[(&str, &str)]) -> String {
         let db = test_db(sources);
-        let renames = file_renames(&db, renames);
+        let renames = file_renames(renames);
         let edits = will_rename_files(&db, &renames);
         render_edits(&db, edits)
     }
@@ -1967,11 +2472,11 @@ mod tests {
             .replace('\\', "/")
     }
 
-    fn file_renames(db: &TestDb, paths: &[(&str, &str)]) -> Vec<FileRename> {
+    fn file_renames(paths: &[(&str, &str)]) -> Vec<FileRename> {
         paths
             .iter()
             .map(|&(old_path, new_path)| FileRename {
-                file: system_path_to_file(db, old_path).unwrap(),
+                old_path: old_path.into(),
                 new_path: new_path.into(),
             })
             .collect()
@@ -1989,5 +2494,13 @@ mod tests {
         db.write_files(files.iter().map(|(path, source)| (path, dedent(source))))
             .unwrap();
         db
+    }
+
+    fn set_search_paths(db: &mut TestDb, search_paths: &SearchPathSettings) {
+        let mut settings = db.project().program_settings(db).clone();
+        settings.search_paths = search_paths
+            .to_search_paths(db.system(), db.vendored(), &FallibleStrategy)
+            .unwrap();
+        db.project().update_program(db, settings);
     }
 }

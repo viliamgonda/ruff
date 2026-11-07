@@ -3068,7 +3068,15 @@ impl<'db> StaticClassLiteral<'db> {
                         return Member::unbound();
                     }
 
-                    // The attribute is declared in the class body.
+                    // An unconditional receiver annotation can declare the field even when the
+                    // class body annotation is conditional.
+                    let merge_declaredness = |origin: TypeOrigin, definedness| {
+                        if origin.is_declared() {
+                            declaredness.max(definedness)
+                        } else {
+                            declaredness
+                        }
+                    };
 
                     let bindings = use_def.end_of_scope_symbol_bindings(symbol_id);
                     let inferred = place_from_bindings(db, env, bindings).place;
@@ -3117,6 +3125,8 @@ impl<'db> StaticClassLiteral<'db> {
                         };
                         if let Place::Defined(DefinedPlace {
                             ty: implicit_ty,
+                            origin: implicit_origin,
+                            definedness: implicit_definedness,
                             provenance: implicit_provenance,
                             ..
                         }) = implicit.inner.place
@@ -3130,7 +3140,10 @@ impl<'db> StaticClassLiteral<'db> {
                                         implicit_ty,
                                     ),
                                     origin: TypeOrigin::Declared,
-                                    definedness: declaredness,
+                                    definedness: merge_declaredness(
+                                        implicit_origin,
+                                        implicit_definedness,
+                                    ),
                                     public_type_policy: PublicTypePolicy::Raw,
                                     provenance: implicit_provenance.or(declared_provenance),
                                 })
@@ -3177,6 +3190,8 @@ impl<'db> StaticClassLiteral<'db> {
                         } else {
                             if let Place::Defined(DefinedPlace {
                                 ty: implicit_ty,
+                                origin: implicit_origin,
+                                definedness: implicit_definedness,
                                 provenance: implicit_provenance,
                                 ..
                             }) = sources
@@ -3193,7 +3208,10 @@ impl<'db> StaticClassLiteral<'db> {
                                             implicit_ty,
                                         ),
                                         origin: TypeOrigin::Declared,
-                                        definedness: declaredness,
+                                        definedness: merge_declaredness(
+                                            implicit_origin,
+                                            implicit_definedness,
+                                        ),
                                         public_type_policy: PublicTypePolicy::Raw,
                                         provenance: implicit_provenance.or(declared_provenance),
                                     })

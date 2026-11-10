@@ -22,11 +22,12 @@ pub(in crate::types) enum TypeContextKind {
 
     /// A declared or inferred validity constraint.
     ///
-    /// Note that unlike a declared type, type context of this kind acts only as a validity
-    /// constraint, and does not provide a preferred specialization during generic call inference.
-    /// This includes the declared upper bound of a type variable, or the inferred type of an instance
-    /// attribute.
+    /// An expected type can supply a fallback for an unsolved type variable. A compatible
+    /// solution inferred from the call arguments takes precedence.
     Validity,
+
+    /// A type variable's upper bound constrains solutions without supplying a fallback.
+    TypeVarBound,
 }
 
 /// The type context for a given expression, e.g., the type annotation
@@ -64,8 +65,8 @@ impl<'db> TypeContext<'db> {
         Self::new(declared_type, TypeContextKind::Declared)
     }
 
-    pub(crate) fn validity(declared_type: Type<'db>) -> Self {
-        Self::new(Some(declared_type), TypeContextKind::Validity)
+    pub(crate) fn expected(declared_type: Option<Type<'db>>) -> Self {
+        Self::new(declared_type, TypeContextKind::Validity)
     }
 
     pub(super) fn from_origin(ty: Type<'db>, origin: TypeOrigin) -> Self {
@@ -74,7 +75,7 @@ impl<'db> TypeContext<'db> {
             // Later assignments are validated against the type of an inferred attribute, but it
             // does not provide a declared type preference, allowing the type of the attribute to
             // be overwritten by a gradual type.
-            TypeOrigin::Inferred => Self::validity(ty),
+            TypeOrigin::Inferred => Self::expected(Some(ty)),
         }
     }
 
@@ -91,7 +92,7 @@ impl<'db> TypeContext<'db> {
     }
 
     pub(crate) fn is_validity(self) -> bool {
-        matches!(self.kind, TypeContextKind::Validity)
+        self.kind == TypeContextKind::Validity || self.kind == TypeContextKind::TypeVarBound
     }
 
     /// If the declared type is a specialized instance of the given `KnownClass`, returns the

@@ -7895,7 +7895,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Option<Type<'db>> {
         // A type variable's upper bound can constrain inferred element types. An empty
         // collection has no elements from which to infer a specialization.
-        let tcx = if elts.is_empty() && tcx.is_validity() {
+        let tcx = if elts.is_empty() && tcx.kind() == super::TypeContextKind::TypeVarBound {
             TypeContext::default()
         } else {
             tcx
@@ -8166,13 +8166,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .variables(self.db())
                 .map(|typevar| {
                     let identity = typevar.identity(self.db());
-                    // Keep this parallel with the slow path below: a covariant context provides
-                    // only an upper bound, which does not determine the specialization for an empty
-                    // literal. A contravariant context provides a lower bound, for which inference
-                    // selects the narrowest valid solution.
-                    if elt_tcx_variance
-                        .get(&identity)
-                        .is_some_and(|variance| variance.is_covariant())
+                    // A covariant context can fill in a missing element type for an empty
+                    // literal. Otherwise, infer the elements within that upper bound below.
+                    if !elts.is_empty()
+                        && elt_tcx_variance
+                            .get(&identity)
+                            .is_some_and(|variance| variance.is_covariant())
                     {
                         return None;
                     }
@@ -8241,11 +8240,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 tuple_size_promotion_constraints.record_declared_type(elt_ty_identity);
             }
 
-            // Avoid unnecessarily widening the return type based on a covariant
-            // type parameter from the type context.
-            //
-            // Note that we also avoid unioning  the inferred type with `Unknown` in this
-            // case, which is only necessary for invariant collections.
+            // A covariant bound can specialize an empty literal on the fast path above.
+            // On its own, a partial bound such as the key type of a dictionary viewed
+            // as an iterable does not determine the collection's specialization.
             if elt_tcx_variance
                 .get(&elt_ty_identity)
                 .is_some_and(|variance| variance.is_covariant())

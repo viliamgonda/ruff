@@ -980,6 +980,19 @@ reveal_type(bounded_list([]))  # revealed: list[Unknown]
 reveal_type(bounded_list(list()))  # revealed: list[Unknown]
 ```
 
+An expected sequence type can supply the element type of an empty list. A type variable with the
+same upper bound leaves the element type unsolved.
+
+```py
+from collections.abc import Sequence
+
+def bounded_sequence[T: Sequence[int]](value: T) -> T:
+    return value
+
+items: Sequence[int] = reveal_type([])  # revealed: list[int]
+reveal_type(bounded_sequence([]))  # revealed: list[Unknown]
+```
+
 The type variable remains unsolved when the upper-bound context passes through another generic call:
 
 ```py
@@ -2433,6 +2446,8 @@ def identity[T](value: T) -> T:
 
 class Fields:
     class_value = None
+    numbers = list[int]()
+    items = iter([0])
 
     def __init__(self, value: Any):
         self.value = None
@@ -2442,6 +2457,22 @@ class Fields:
 def _(value: Any):
     Fields.class_value = reveal_type(identity(value))  # revealed: Any
     reveal_type(Fields.class_value)  # revealed: Any
+    Fields.numbers = reveal_type(list())  # revealed: list[int]
+    Fields.items = reveal_type(iter([]))  # revealed: Iterator[int]
+```
+
+The callback determines the parameter list `P`. The inferred attribute supplies the element type `T`
+of the returned list.
+
+```py
+from collections.abc import Callable
+
+def make_list[**P, T](callback: Callable[P, None]) -> list[T]:
+    return []
+
+def _():
+    Fields.numbers = make_list(lambda: None)
+    Fields.numbers.append("wrong")  # error: [invalid-argument-type]
 ```
 
 An instance annotation applies even when the class body conditionally annotates the same field.

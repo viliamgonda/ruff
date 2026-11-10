@@ -1652,6 +1652,25 @@ def default[T = Callable[[int], int]](callback: T) -> None: ...
 forward(default, lambda x: reveal_type(x))  # revealed: int
 ```
 
+### Inferring a return type without argument evidence
+
+The callback determines the parameter list `P`. When the arguments do not determine the return type
+`T`, the expected type can supply it.
+
+```py
+from collections.abc import Callable
+
+def result[**P, T](callback: Callable[P, None]) -> T:
+    raise NotImplementedError
+
+def callback() -> None: ...
+
+reveal_type(result(callback))  # revealed: Unknown
+
+def use() -> str:
+    return reveal_type(result(callback))  # revealed: str
+```
+
 ### Forwarded arguments with type-variable bounds
 
 When a type variable is bounded by `LiteralString`, string literals are not promoted to `str` when

@@ -6763,52 +6763,33 @@ impl<'db> CallInference<'_, 'db> {
             &mut constraint_set_errors,
         );
 
-        let return_context = match self.call_expression_tcx.declared_type() {
-            None => None,
-
-            Some(tcx) if self.call_expression_tcx.is_validity() => {
-                let validity = self
-                    .return_ty
-                    .when_constraint_set_assignable_to_with_provenance(
-                        db,
-                        self.env,
-                        tcx,
-                        constraints,
-                        ConstraintProvenance::VALIDITY,
-                    );
-                builder.record_constraint_set(validity);
-                None
-            }
-
-            Some(tcx) => {
-                let return_ty = self
-                    .return_ty
-                    .discard_disjoint_union_elements(db, self.env, tcx, self.inferable_typevars)
-                    .or_never();
-                let tcx = tcx
-                    .discard_disjoint_union_elements(
-                        db,
-                        self.env,
-                        return_ty,
-                        self.inferable_typevars,
-                    )
-                    .or_never();
-                let declared_constraints = return_ty
-                    .when_constraint_set_assignable_to_with_provenance(
-                        db,
-                        self.env,
-                        tcx,
-                        constraints,
-                        ConstraintProvenance::DECLARED,
-                    );
-                builder.record_constraint_set(declared_constraints);
-                Some((return_ty, tcx))
-            }
-        };
+        let return_context = self.call_expression_tcx.declared_type().map(|tcx| {
+            let return_ty = self
+                .return_ty
+                .discard_disjoint_union_elements(db, self.env, tcx, self.inferable_typevars)
+                .or_never();
+            let tcx = tcx
+                .discard_disjoint_union_elements(db, self.env, return_ty, self.inferable_typevars)
+                .or_never();
+            let provenance = if self.call_expression_tcx.kind() == TypeContextKind::TypeVarBound {
+                ConstraintProvenance::VALIDITY
+            } else {
+                ConstraintProvenance::DECLARED
+            };
+            let return_constraints = return_ty.when_constraint_set_assignable_to_with_provenance(
+                db,
+                self.env,
+                tcx,
+                constraints,
+                provenance,
+            );
+            builder.record_constraint_set(return_constraints);
+            (return_ty, tcx)
+        });
 
         let mut solution = self.solve(constraints, &mut builder, return_context);
 
-        // If we failed to infer a compatible specialization, retry without the declared type.
+        // If we failed to infer a compatible specialization, retry without the expected return type.
         //
         // Note that this retry only exists to provide more precise diagnostics in cases where
         // the declared type may partially influence the type inferred for the call, leading to
@@ -6881,7 +6862,7 @@ impl<'db> CallInference<'_, 'db> {
         let (preferred_type_mappings, preferred_solutions_incomplete) = self
             .call_expression_tcx
             .declared_type()
-            .filter(|_| !self.call_expression_tcx.is_validity())
+            .filter(|_| self.call_expression_tcx.kind() != TypeContextKind::TypeVarBound)
             .and_then(|tcx| {
                 if !tcx
                     .filter_union(db, self.env, |ty| ty.may_prefer_declared_type(db, self.env))
@@ -6989,21 +6970,23 @@ impl<'db> CallInference<'_, 'db> {
 
                 // Add preferred types to the builder so they serve as the base mapping
                 // when argument inference adds more types.
-                for solution in solutions.as_slice() {
-                    for binding in &solution.solved_typevars {
-                        let identity = binding.bound_typevar.identity(db);
-                        // A `ParamSpec` keeps its first binding, so seeding it here would discard
-                        // the inferred parameter list of the argument.
-                        if binding.bound_typevar.is_paramspec(db) {
-                            continue;
-                        }
+                if !self.call_expression_tcx.is_validity() {
+                    for solution in solutions.as_slice() {
+                        for binding in &solution.solved_typevars {
+                            let identity = binding.bound_typevar.identity(db);
+                            // A `ParamSpec` keeps its first binding, so seeding it here would discard
+                            // the inferred parameter list of the argument.
+                            if binding.bound_typevar.is_paramspec(db) {
+                                continue;
+                            }
 
-                        if let Some(&ty) = preferred.get(&identity) {
-                            builder.add_type_mapping(
-                                binding.bound_typevar,
-                                ty,
-                                TypeVarVariance::Invariant,
-                            );
+                            if let Some(&ty) = preferred.get(&identity) {
+                                builder.add_type_mapping(
+                                    binding.bound_typevar,
+                                    ty,
+                                    TypeVarVariance::Invariant,
+                                );
+                            }
                         }
                     }
                 }
@@ -7108,7 +7091,14 @@ impl<'db> CallInference<'_, 'db> {
         let db = self.db;
         let typevar = bounds.bound_typevar;
 
-        CandidateSolutions::default_solve(db, self.env, constraints, bounds).map(|solution| {
+        CandidateSolutions::solve_with_preference(
+            db,
+            self.env,
+            constraints,
+            bounds,
+            !self.call_expression_tcx.is_validity(),
+        )
+        .map(|solution| {
             let bound_or_constraints = typevar.typevar(db).bound_or_constraints(db, self.env);
 
             // For constrained TypeVars, the inferred type is already one of the
@@ -7170,11 +7160,11 @@ impl<'db> CallInference<'_, 'db> {
     /// for `list[T]` in a `list[object]` context, used only when compatible with the argument evidence.
     /// `preferred_solutions_incomplete` marks inference as incomplete when it uses preferences whose
     /// computation reached a work limit.
-    fn solve_legacy(
+    fn solve_legacy<'c>(
         &self,
-        constraints: &ConstraintSetBuilder<'db>,
+        constraints: &'c ConstraintSetBuilder<'db>,
         generic_context: GenericContext<'db>,
-        mut builder: SpecializationBuilder<'db, '_>,
+        mut builder: SpecializationBuilder<'db, 'c>,
         preferred_type_mappings: &FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
         preferred_solutions_incomplete: bool,
         specialization_errors: &mut Vec<BindingError<'db>>,
@@ -7208,9 +7198,10 @@ impl<'db> CallInference<'_, 'db> {
                 // contextual types substituted, rather than rejecting the preference because
                 // `_VT` is still unsolved. Variables without a preference retain their identity.
                 if preferred_ty.is_none_or(|ty| {
-                    !lower
-                        .apply_optional_specialization(db, preferred_specialization)
-                        .is_assignable_to(db, self.env, ty)
+                    let lower = lower.apply_optional_specialization(db, preferred_specialization);
+                    !lower.is_assignable_to(db, self.env, ty)
+                        || (self.call_expression_tcx.is_validity()
+                            && ty.is_assignable_to(db, self.env, lower))
                 }) {
                     return Some(self.solve_typevar(constraints, bounds));
                 }
@@ -7226,11 +7217,48 @@ impl<'db> CallInference<'_, 'db> {
             })
         };
 
-        builder
-            .build_inference_with(ReportDiagnostics::Yes, &mut choose)
-            .unwrap_or_else(|errors| {
-                self.inference_recovery(&mut builder, errors, specialization_errors, choose)
+        let inference = match builder.build_inference_with(ReportDiagnostics::Yes, &mut choose) {
+            Ok(inference) => inference,
+            Err(errors) => {
+                return self.inference_recovery(
+                    &mut builder,
+                    errors,
+                    specialization_errors,
+                    choose,
+                );
+            }
+        };
+        let Some(expected) = self.call_expression_tcx.declared_type() else {
+            return inference;
+        };
+        if self.call_expression_tcx.kind() == TypeContextKind::TypeVarBound
+            || !generic_context.variables(db).any(|variable| {
+                !inference.has_inferred_type(db, variable.identity(db))
+                    && self.return_ty.references_typevar_through_aliases(
+                        db,
+                        self.env,
+                        variable.typevar(db).identity(db),
+                    )
             })
+        {
+            return inference;
+        }
+
+        // The expected result can solve a variable absent from the arguments, including one that
+        // occurs only covariantly in the return type. Keep bindings already inferred for its peers.
+        let partial = inference.merged_specialization_with(db, |variable, ty| {
+            ty.is_none().then_some(Type::TypeVar(variable))
+        });
+        let fallback = self
+            .return_ty
+            .apply_specialization(db, partial)
+            .when_constraint_set_assignable_to(db, self.env, expected, constraints);
+        if builder.add_constraint_set(fallback).is_err() {
+            return inference;
+        }
+        builder
+            .build_inference_with(ReportDiagnostics::No, choose)
+            .unwrap_or(inference)
     }
 
     fn inference_recovery(
@@ -8877,7 +8905,7 @@ impl<'db> Binding<'db> {
         {
             return Some(ArgumentTypeContext::standard(
                 original_parameter_type,
-                TypeContext::validity(bound),
+                TypeContext::new(Some(bound), TypeContextKind::TypeVarBound),
             ));
         }
 
@@ -8948,7 +8976,7 @@ impl<'db> Binding<'db> {
             && call_expression_tcx.is_validity()
             && parameter_type != original_parameter_type
         {
-            tcx_kind = TypeContextKind::Validity;
+            tcx_kind = call_expression_tcx.kind();
         }
 
         Some(ArgumentTypeContext::standard(

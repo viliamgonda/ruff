@@ -4176,6 +4176,16 @@ impl<'db> CandidateSolutions<'db> {
         builder: &ConstraintSetBuilder<'db>,
         path_bound: &CandidateTypeVarSolution<'db>,
     ) -> PathBoundSolution<'db> {
+        Self::solve_with_preference(db, env, builder, path_bound, true)
+    }
+
+    pub(crate) fn solve_with_preference(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        builder: &ConstraintSetBuilder<'db>,
+        path_bound: &CandidateTypeVarSolution<'db>,
+        prefer_declared: bool,
+    ) -> PathBoundSolution<'db> {
         let default_solution =
             Self::solve_from_evidence(db, env, builder, path_bound, EvidenceSource::All);
         let PathBoundSolution::Solved(restricted) = default_solution else {
@@ -4213,11 +4223,12 @@ impl<'db> CandidateSolutions<'db> {
         }
         .filter(|candidate| !candidate.has_provisional_marker(db, env));
 
-        // Prefer the declared candidate when it is mutually assignable with the inferred
-        // candidate. Otherwise, prefer the inferred candidate.
+        // An expected type can fill a variable left unsolved by the arguments. The context
+        // determines whether it also wins a tie between mutually assignable candidates.
         let candidates = match (inferred, declared) {
             (Some(inferred), Some(declared))
-                if inferred.is_assignable_to(db, env, declared)
+                if prefer_declared
+                    && inferred.is_assignable_to(db, env, declared)
                     && declared.is_assignable_to(db, env, inferred) =>
             {
                 [Some(declared), Some(inferred)]

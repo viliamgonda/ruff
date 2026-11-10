@@ -6881,6 +6881,7 @@ impl<'db> CallInference<'_, 'db> {
         let (preferred_type_mappings, preferred_solutions_incomplete) = self
             .call_expression_tcx
             .declared_type()
+            .filter(|_| !self.call_expression_tcx.is_validity())
             .and_then(|tcx| {
                 if !tcx
                     .filter_union(db, self.env, |ty| ty.may_prefer_declared_type(db, self.env))
@@ -8864,13 +8865,15 @@ impl<'db> Binding<'db> {
         };
 
         // If the parameter is a single non-ParamSpec type variable with an upper bound,
-        // e.g., `typing.Self`, use the upper bound as type context. ParamSpec components
-        // need to reach generic call specialization below, where earlier arguments can
-        // specialize the full `ParamSpec`.
-        if let Type::TypeVar(typevar) = parameter_type
+        // e.g., `typing.Self`, use the upper bound unless an assignment annotation has
+        // already specialized it. ParamSpec components need to reach generic call specialization
+        // below, where earlier arguments can specialize the full `ParamSpec`.
+        if let Type::TypeVar(typevar) = parameter_type.resolve_type_alias(db)
             && !typevar.is_paramspec(db)
-            && let Some(TypeVarBoundOrConstraints::UpperBound(bound)) =
-                typevar.typevar(db).bound_or_constraints(db, env)
+            && let Some(bound) = typevar.typevar(db).upper_bound(db, env)
+            && (call_expression_tcx.kind() != TypeContextKind::Declared
+                || specialization().and_then(|specialization| specialization.kind_for(db, typevar))
+                    != Some(TypeContextKind::Declared))
         {
             return Some(ArgumentTypeContext::standard(
                 original_parameter_type,

@@ -976,6 +976,8 @@ def bounded_list[T: list[int]](value: T) -> T:
     return value
 
 reveal_type(bounded_list(empty_list()))  # revealed: list[Unknown]
+reveal_type(bounded_list([]))  # revealed: list[Unknown]
+reveal_type(bounded_list(list()))  # revealed: list[Unknown]
 ```
 
 The type variable remains unsolved when the upper-bound context passes through another generic call:

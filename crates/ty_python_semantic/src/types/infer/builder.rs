@@ -7893,6 +7893,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         infer_elt_expression: &mut dyn FnMut(&mut Self, ArgExpr<'db, 'expr>) -> Type<'db>,
         tcx: TypeContext<'db>,
     ) -> Option<Type<'db>> {
+        // A type variable's upper bound can constrain inferred element types. An empty
+        // collection has no elements from which to infer a specialization.
+        let tcx = if elts.is_empty() && tcx.is_validity() {
+            TypeContext::default()
+        } else {
+            tcx
+        };
         self.infer_collection_with_union_context(tcx, |builder, tcx| {
             builder.infer_collection_literal_impl(
                 collection_class,

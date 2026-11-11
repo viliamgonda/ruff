@@ -400,6 +400,9 @@ impl<'a, E: Element> List<'a, E> {
     }
 
     pub(super) fn words(self) -> &'a [u32] {
+        if self.is_empty() {
+            return &[];
+        }
         let start = self.range.start as usize;
         &self.ast.extra[start..start + self.len()]
     }

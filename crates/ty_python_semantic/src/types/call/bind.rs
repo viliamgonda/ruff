@@ -298,6 +298,12 @@ fn generic_context_has_paramspec<'db>(
         .any(|typevar| typevar.is_paramspec(db))
 }
 
+fn uses_legacy_inference<'db>(db: &'db dyn Db, generic_context: GenericContext<'db>) -> bool {
+    generic_context
+        .variables(db)
+        .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db))
+}
+
 /// A single callable item within the union/intersection structure.
 /// Either a regular callable, or a constructor callable.
 #[derive(Debug, Clone, get_size2::GetSize, salsa::SalsaValue)]
@@ -6453,10 +6459,7 @@ impl<'db> CallInference<'_, 'db> {
         let generic_context = inference.generic_context(db);
         // TODO: Account for parameter-list and variadic-tuple bindings when refining returns.
         // In particular, `Callable[P, R]` can capture state linking its inputs and output.
-        if generic_context
-            .variables(db)
-            .any(|variable| variable.is_paramspec(db) || variable.is_typevartuple(db))
-        {
+        if uses_legacy_inference(db, generic_context) {
             return (specialize_return_ty(merged_specialization), false);
         }
         // An unresolved dependency does not make an alternative invalid. Keep the merged fallback
@@ -6511,8 +6514,8 @@ impl<'db> CallInference<'_, 'db> {
         let is_compatible_return = |ty: Type<'db>| {
             let expected_return = self
                 .call_expression_tcx
-                .declared_type()
-                .filter(|_| self.call_expression_tcx.kind() == TypeContextKind::Declared);
+                .expected_type()
+                .filter(|_| self.call_expression_tcx.kind() == TypeContextKind::preference());
 
             expected_return
                 .is_none_or(|expected_return| ty.is_assignable_to(db, env, expected_return))
@@ -6745,10 +6748,7 @@ impl<'db> CallInference<'_, 'db> {
             };
         };
 
-        if generic_context
-            .variables(db)
-            .any(|typevar| typevar.is_paramspec(db) || typevar.is_typevartuple(db))
-        {
+        if uses_legacy_inference(db, generic_context) {
             return self.infer_legacy(constraints, generic_context, constraint_set_errors);
         }
 
@@ -6763,52 +6763,33 @@ impl<'db> CallInference<'_, 'db> {
             &mut constraint_set_errors,
         );
 
-        let return_context = match self.call_expression_tcx.declared_type() {
-            None => None,
-
-            Some(tcx) if self.call_expression_tcx.is_validity() => {
-                let validity = self
-                    .return_ty
-                    .when_constraint_set_assignable_to_with_provenance(
-                        db,
-                        self.env,
-                        tcx,
-                        constraints,
-                        ConstraintProvenance::VALIDITY,
-                    );
-                builder.record_constraint_set(validity);
-                None
-            }
-
-            Some(tcx) => {
-                let return_ty = self
-                    .return_ty
-                    .discard_disjoint_union_elements(db, self.env, tcx, self.inferable_typevars)
-                    .or_never();
-                let tcx = tcx
-                    .discard_disjoint_union_elements(
-                        db,
-                        self.env,
-                        return_ty,
-                        self.inferable_typevars,
-                    )
-                    .or_never();
-                let declared_constraints = return_ty
-                    .when_constraint_set_assignable_to_with_provenance(
-                        db,
-                        self.env,
-                        tcx,
-                        constraints,
-                        ConstraintProvenance::DECLARED,
-                    );
-                builder.record_constraint_set(declared_constraints);
-                Some((return_ty, tcx))
-            }
-        };
+        let return_context = self.call_expression_tcx.expected_type().map(|tcx| {
+            let return_ty = self
+                .return_ty
+                .discard_disjoint_union_elements(db, self.env, tcx, self.inferable_typevars)
+                .or_never();
+            let tcx = tcx
+                .discard_disjoint_union_elements(db, self.env, return_ty, self.inferable_typevars)
+                .or_never();
+            let provenance = if self.call_expression_tcx.kind() == TypeContextKind::Validity {
+                ConstraintProvenance::VALIDITY
+            } else {
+                ConstraintProvenance::DECLARED
+            };
+            let return_constraints = return_ty.when_constraint_set_assignable_to_with_provenance(
+                db,
+                self.env,
+                tcx,
+                constraints,
+                provenance,
+            );
+            builder.record_constraint_set(return_constraints);
+            (return_ty, tcx)
+        });
 
         let mut solution = self.solve(constraints, &mut builder, return_context);
 
-        // If we failed to infer a compatible specialization, retry without the declared type.
+        // If we failed to infer a compatible specialization, retry without the expected return type.
         //
         // Note that this retry only exists to provide more precise diagnostics in cases where
         // the declared type may partially influence the type inferred for the call, leading to
@@ -6834,7 +6815,15 @@ impl<'db> CallInference<'_, 'db> {
                 &mut builder,
                 errors,
                 &mut specialization_errors,
-                |_, bounds| bounds.map(|bounds| self.solve_typevar(constraints, bounds)),
+                |_, bounds| {
+                    bounds.map(|bounds| {
+                        self.solve_typevar(
+                            constraints,
+                            bounds,
+                            self.call_expression_tcx.should_prefer_expected_type(),
+                        )
+                    })
+                },
             );
             let (return_ty, arguments_validated) = self.select_return_type(inference);
             (inference, return_ty, arguments_validated)
@@ -6880,7 +6869,7 @@ impl<'db> CallInference<'_, 'db> {
         // constraint solver.
         let (preferred_type_mappings, preferred_solutions_incomplete) = self
             .call_expression_tcx
-            .declared_type()
+            .expected_type()
             .and_then(|tcx| {
                 if !tcx
                     .filter_union(db, self.env, |ty| ty.may_prefer_declared_type(db, self.env))
@@ -7079,7 +7068,13 @@ impl<'db> CallInference<'_, 'db> {
         };
 
         let inference = builder.build_inference_with(report_diagnostics, |_, bounds| {
-            bounds.map(|bounds| self.solve_typevar(constraints, bounds))
+            bounds.map(|bounds| {
+                self.solve_typevar(
+                    constraints,
+                    bounds,
+                    self.call_expression_tcx.should_prefer_expected_type(),
+                )
+            })
         })?;
         let (return_ty, arguments_validated) = self.select_return_type(inference);
 
@@ -7103,11 +7098,19 @@ impl<'db> CallInference<'_, 'db> {
         &self,
         constraints: &ConstraintSetBuilder<'db>,
         bounds: &CandidateTypeVarSolution<'db>,
+        prefer_declared: bool,
     ) -> PathBoundSolution<'db> {
         let db = self.db;
         let typevar = bounds.bound_typevar;
 
-        CandidateSolutions::default_solve(db, self.env, constraints, bounds).map(|solution| {
+        CandidateSolutions::solve_with_preference(
+            db,
+            self.env,
+            constraints,
+            bounds,
+            prefer_declared,
+        )
+        .map(|solution| {
             let bound_or_constraints = typevar.typevar(db).bound_or_constraints(db, self.env);
 
             // For constrained TypeVars, the inferred type is already one of the
@@ -7211,7 +7214,7 @@ impl<'db> CallInference<'_, 'db> {
                         .apply_optional_specialization(db, preferred_specialization)
                         .is_assignable_to(db, self.env, ty)
                 }) {
-                    return Some(self.solve_typevar(constraints, bounds));
+                    return Some(self.solve_typevar(constraints, bounds, true));
                 }
             }
 
@@ -8317,7 +8320,7 @@ impl<'db> ArgumentTypeContext<'db> {
     pub(crate) fn type_context(self) -> TypeContext<'db> {
         match self {
             Self::Standard { context, .. } => context,
-            Self::ParamSpec { declared_type, .. } => TypeContext::declared(Some(declared_type)),
+            Self::ParamSpec { declared_type, .. } => TypeContext::preference(Some(declared_type)),
         }
     }
 
@@ -8332,8 +8335,8 @@ impl<'db> ArgumentTypeContext<'db> {
             Self::Standard {
                 raw_parameter_type,
                 context,
-            } => context.with_declared_type(Some(raw_parameter_type)),
-            Self::ParamSpec { declared_type, .. } => TypeContext::declared(Some(declared_type)),
+            } => context.with_expected_type(Some(raw_parameter_type)),
+            Self::ParamSpec { declared_type, .. } => TypeContext::preference(Some(declared_type)),
         }
     }
 
@@ -8864,21 +8867,32 @@ impl<'db> Binding<'db> {
         };
 
         // If the parameter is a single non-ParamSpec type variable with an upper bound,
-        // e.g., `typing.Self`, use the upper bound as type context. ParamSpec components
-        // need to reach generic call specialization below, where earlier arguments can
-        // specialize the full `ParamSpec`.
-        if let Type::TypeVar(typevar) = parameter_type
+        // e.g., `typing.Self`, use the upper bound unless an assignment annotation has
+        // already specialized it. ParamSpec components need to reach generic call specialization
+        // below, where earlier arguments can specialize the full `ParamSpec`.
+        if let Type::TypeVar(typevar) = parameter_type.resolve_type_alias(db)
             && !typevar.is_paramspec(db)
-            && let Some(TypeVarBoundOrConstraints::UpperBound(bound)) =
-                typevar.typevar(db).bound_or_constraints(db, env)
+            && let Some(bound) = typevar.typevar(db).upper_bound(db, env)
+            && match self.signature.generic_context {
+                // Legacy inference uses the upper bound of a bare type variable.
+                Some(context) if uses_legacy_inference(db, context) => {
+                    parameter_type == Type::TypeVar(typevar)
+                }
+                _ => {
+                    call_expression_tcx.kind() != TypeContextKind::preference()
+                        || specialization()
+                            .and_then(|specialization| specialization.kind_for(db, typevar))
+                            != Some(TypeContextKind::preference())
+                }
+            }
         {
             return Some(ArgumentTypeContext::standard(
                 original_parameter_type,
-                TypeContext::validity(bound),
+                TypeContext::new(Some(bound), TypeContextKind::Validity),
             ));
         }
 
-        let mut tcx_kind = TypeContextKind::Declared;
+        let mut tcx_kind = TypeContextKind::preference();
 
         // If this is a generic call, specialize the parameter type using the computed constraints.
         if self.signature.generic_context.is_some() {
@@ -8924,7 +8938,7 @@ impl<'db> Binding<'db> {
                 parameter_type = parameter_type.apply_specialization(db, specialization.types);
             }
 
-            if let Some(expected_return_ty) = call_expression_tcx.declared_type()
+            if let Some(expected_return_ty) = call_expression_tcx.expected_type()
                 && let Some(expected) = self.typevartuple_argument_context(
                     db,
                     env,
@@ -8939,13 +8953,13 @@ impl<'db> Binding<'db> {
             }
         }
 
-        // A parameter specialized using the declared type of an outer type variable should remain
-        // as validity type context.
-        if tcx_kind == TypeContextKind::Declared
-            && call_expression_tcx.is_validity()
+        // Specializing a parameter from an outer context that supplies no preference should
+        // preserve that context's kind.
+        if tcx_kind == TypeContextKind::preference()
+            && !call_expression_tcx.should_prefer_expected_type()
             && parameter_type != original_parameter_type
         {
-            tcx_kind = TypeContextKind::Validity;
+            tcx_kind = call_expression_tcx.kind();
         }
 
         Some(ArgumentTypeContext::standard(
@@ -9006,7 +9020,7 @@ impl<'db> Binding<'db> {
                 generic_context,
                 Some(inference),
                 &FxHashMap::default(),
-                TypeContextKind::Declared,
+                TypeContextKind::preference(),
             ))
         }
 
@@ -9014,13 +9028,13 @@ impl<'db> Binding<'db> {
 
         let mut return_type_solutions: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
             FxHashMap::default();
-        if let Some(declared_return_ty) = call_expression_tcx.declared_type() {
+        if let Some(expected_return_ty) = call_expression_tcx.expected_type() {
             let inferable = generic_context.inferable_typevars(db);
             let normalized_return_ty = self.unspecialized_return_type(db);
             let path_bounds = normalized_return_ty.assignable_solutions_for_argument_context(
                 db,
                 env,
-                declared_return_ty,
+                expected_return_ty,
                 inferable,
             );
 

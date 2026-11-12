@@ -736,6 +736,21 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             .all(|&index| self.items.get(index) == other.items.get(index))
     }
 
+    /// Replace the arguments narrowed by one step of overload argument expansion, preserving the
+    /// final inference of every other argument.
+    pub(super) fn apply_expansion(&mut self, original: &Self, expanded: &Self) {
+        for ((argument, original), expanded) in self
+            .items
+            .iter_mut()
+            .zip(original.iter())
+            .zip(expanded.iter())
+        {
+            if original != expanded {
+                argument.clone_from(expanded);
+            }
+        }
+    }
+
     /// Prepend an optional extra synthetic argument (for a `self` or `cls` parameter) to the front
     /// of this argument list. (If `bound_self` is none, we return the argument list
     /// unmodified.)

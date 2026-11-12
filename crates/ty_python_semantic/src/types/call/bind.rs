@@ -1447,13 +1447,29 @@ impl<'db> Bindings<'db> {
 
     /// Finalize the bindings after a provisional check, retaining only those that contribute
     /// to the final call evaluation.
-    pub(crate) fn finalize_argument_inference(
+    pub(crate) fn finalize_argument_inference<'a>(
         &mut self,
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
-        call_arguments: &CallArguments<'_, 'db>,
+        call_arguments: &CallArguments<'a, 'db>,
         dataclass_field_specifiers: &[Type<'db>],
+        overload_resolution: Option<(&CallArguments<'a, 'db>, TypeContext<'db>)>,
     ) -> Result<(), CallErrorKind> {
+        if let Some((matching_arguments, result_tcx)) = overload_resolution
+            && (matching_arguments.iter().ne(call_arguments.iter())
+                || (result_tcx.expected_type().is_some()
+                    && result_tcx.kind() == TypeContextKind::preference()))
+        {
+            for binding in self.iter_flat_mut() {
+                binding.check_selected_overloads(
+                    db,
+                    env,
+                    matching_arguments,
+                    call_arguments,
+                    result_tcx,
+                );
+            }
+        }
         self.evaluate_known_cases(db, env, call_arguments, dataclass_field_specifiers);
 
         for constructor in self.iter_constructor_items_mut() {
@@ -1465,6 +1481,7 @@ impl<'db> Bindings<'db> {
                     env,
                     call_arguments,
                     dataclass_field_specifiers,
+                    overload_resolution,
                 );
             }
         }
@@ -1474,6 +1491,21 @@ impl<'db> Bindings<'db> {
         }
 
         self.as_result(db)
+    }
+
+    /// Start argument inference for the selected overloads without carrying over the type
+    /// variable solutions from overload resolution.
+    pub(crate) fn clear_argument_context_inference(&mut self) {
+        for binding in self.iter_flat_mut() {
+            for overload in &mut binding.overloads {
+                overload.inference = None;
+            }
+        }
+        for constructor in self.iter_constructor_items_mut() {
+            if let Some(downstream) = constructor.downstream_constructor_mut() {
+                downstream.clear_argument_context_inference();
+            }
+        }
     }
 
     /// Returns true if this is a single callable (not a union or intersection).
@@ -4125,12 +4157,12 @@ impl<'db> CallableBinding<'db> {
 
         // State of the bindings _after_ evaluating (type checking) the matching overloads using
         // the non-expanded argument types.
-        let post_evaluation_snapshot = snapshotter.take(self);
+        let mut post_evaluation_snapshot = snapshotter.take(self);
 
-        for expansion in expansions {
+        for (expansion_index, expansion) in expansions.enumerate() {
             let expanded_argument_lists = match expansion {
                 Expansion::LimitReached(index) => {
-                    snapshotter.restore(self, post_evaluation_snapshot);
+                    post_evaluation_snapshot.swap_with(self);
                     self.overload_call_result =
                         Some(OverloadCallResult::ArgumentTypeExpansionLimitReached(index));
                     return;
@@ -4233,31 +4265,10 @@ impl<'db> CallableBinding<'db> {
                 }
             }
 
-            if cases.len() == expanded_argument_lists.len()
-                && let Some((first, rest)) = cases.split_first()
-            {
-                // The merged view supports consumers that need one binding per overload. Keep
-                // the individual evaluations as well: the same generic overload can infer a
-                // different specialization for each expanded argument list.
-                let mut merged_evaluation_state = first.snapshot.clone();
-                for case in rest {
-                    merged_evaluation_state.update(&case.snapshot);
-                }
-                snapshotter.restore(self, merged_evaluation_state);
-
-                // Every expanded argument list must succeed. Alternative matches within a case
-                // cannot compensate for a different argument list with no matches.
-                self.overload_call_result = Some(OverloadCallResult::ArgumentTypeExpansion(
-                    Box::new(ExpandedOverloadCall {
-                        return_type: UnionType::from_elements(
-                            db,
-                            env,
-                            cases.iter().map(|case| case.return_type),
-                        ),
-                        cases: cases.into_boxed_slice(),
-                    }),
-                ));
-
+            // Every expanded argument list must succeed. Alternative matches within a case
+            // cannot compensate for a different argument list with no matches.
+            if cases.len() == expanded_argument_lists.len() && !cases.is_empty() {
+                self.finish_expansion(db, env, expansion_index, cases.into_boxed_slice());
                 return;
             }
         }
@@ -4266,7 +4277,112 @@ impl<'db> CallableBinding<'db> {
         // bindings state back to the one after the type checking step using the non-expanded
         // argument types. This is necessary because we restore the state to the pre-evaluation
         // snapshot when processing the expanded argument lists.
-        snapshotter.restore(self, post_evaluation_snapshot);
+        post_evaluation_snapshot.swap_with(self);
+    }
+
+    fn finish_expansion(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        expansion_index: usize,
+        cases: Box<[ExpandedCallEvaluation<'db>]>,
+    ) {
+        // The merged view supports consumers that need one binding per overload. Keep the
+        // individual evaluations too: one generic overload can have a different specialization
+        // for each expanded argument list.
+        let Some((first, rest)) = cases.split_first() else {
+            return;
+        };
+        let mut merged = first.snapshot.clone();
+        for case in rest {
+            merged.update(&case.snapshot);
+        }
+        merged.swap_with(self);
+        self.overload_call_result = Some(OverloadCallResult::ArgumentTypeExpansion(Box::new(
+            ExpandedOverloadCall {
+                return_type: UnionType::from_elements(
+                    db,
+                    env,
+                    cases.iter().map(|case| case.return_type),
+                ),
+                expansion_index,
+                cases,
+            },
+        )));
+    }
+
+    fn check_selected_overloads<'a>(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        matching_arguments: &CallArguments<'a, 'db>,
+        final_arguments: &CallArguments<'a, 'db>,
+        call_expression_tcx: TypeContext<'db>,
+    ) {
+        let matching_arguments = matching_arguments.with_self(self.bound_type);
+        let final_arguments = final_arguments.with_self(self.bound_type);
+
+        let Some(OverloadCallResult::ArgumentTypeExpansion(expanded)) =
+            &mut self.overload_call_result
+        else {
+            self.check_selected_signatures(db, env, &final_arguments, call_expression_tcx);
+            return;
+        };
+        let expansions = matching_arguments.expansions(db, env);
+        let Some(Expansion::Expanded(arguments)) = expansions.iter().nth(expanded.expansion_index)
+        else {
+            return;
+        };
+        let expansion_index = expanded.expansion_index;
+        let mut cases = std::mem::take(&mut expanded.cases);
+        for (case, expanded_arguments) in cases.iter_mut().zip(arguments) {
+            case.snapshot.swap_with(self);
+            let mut committed = final_arguments.as_ref().clone();
+            committed.apply_expansion(&matching_arguments, &expanded_arguments);
+            self.check_selected_signatures(db, env, &committed, call_expression_tcx);
+            // As during selection, every expanded argument list must succeed.
+            if self.matching_overloads().next().is_none() {
+                return;
+            }
+            case.return_type = self.return_type();
+            case.snapshot.swap_with(self);
+        }
+        self.finish_expansion(db, env, expansion_index, cases);
+    }
+
+    fn check_selected_signatures(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        final_arguments: &CallArguments<'_, 'db>,
+        call_expression_tcx: TypeContext<'db>,
+    ) {
+        let selected: SmallVec<[_; 2]> =
+            self.selected_overloads().map(|(index, _)| index).collect();
+        for index in selected {
+            let overload = &mut self.overloads[index];
+            overload.reset(db);
+            overload.match_parameters(db, env, final_arguments);
+            overload.check_types(db, env, final_arguments, call_expression_tcx);
+            if self.overload_call_result.is_none()
+                && overload.has_errors_affecting_overload_resolution()
+            {
+                // Step 6 picked this overload from signatures with equivalent return types.
+                // Report its error without switching to a signature that wasn't selected.
+                for (_, other) in self.matching_overloads_mut() {
+                    other.mark_as_unmatched_overload();
+                }
+            }
+        }
+
+        if matches!(
+            self.overload_call_result,
+            Some(OverloadCallResult::Ambiguous(_))
+        ) {
+            self.overload_call_result = Some(OverloadCallResult::Ambiguous(
+                self.merge_ambiguous_return_types(db, env),
+            ));
+        }
     }
 
     /// Returns the set of overload candidates that may contribute to the call evaluation.
@@ -4636,10 +4752,11 @@ impl<'db> CallableBinding<'db> {
             .filter(|(_, overload)| !overload.has_errors_affecting_overload_resolution())
     }
 
-    /// Returns the overloads selected for deprecation reporting without changing the matches
-    /// retained for argument inference. Equivalent return types select the first match;
-    /// ambiguous calls retain every match, and argument expansion combines its selected matches.
-    fn selected_overloads(&self) -> impl Iterator<Item = (usize, &Binding<'db>)> + Clone {
+    /// Equivalent return types select the first match, ambiguous calls retain every match,
+    /// and argument expansion combines the overloads selected by each case.
+    pub(crate) fn selected_overloads(
+        &self,
+    ) -> impl Iterator<Item = (usize, &Binding<'db>)> + Clone {
         let matching = self.matching_overloads();
         let Some(result) = &self.overload_call_result else {
             return Either::Left(matching.take(1));
@@ -5004,6 +5121,8 @@ enum OverloadCallResult<'db> {
 #[derive(Debug, Clone, get_size2::GetSize, salsa::SalsaValue)]
 struct ExpandedOverloadCall<'db> {
     return_type: Type<'db>,
+    /// Which argument expansion produced these cases, in source order.
+    expansion_index: usize,
     cases: Box<[ExpandedCallEvaluation<'db>]>,
 }
 
@@ -9527,22 +9646,16 @@ impl<'db> Binding<'db> {
         }
     }
 
-    fn restore(&mut self, snapshot: BindingSnapshot<'db>) {
-        let BindingSnapshot {
-            return_ty,
-            inferable_typevars,
-            inference,
-            argument_matches,
-            parameter_tys,
-            errors,
-        } = snapshot;
-
-        self.return_ty = return_ty;
-        self.inferable_typevars = inferable_typevars;
-        self.inference = inference;
-        self.argument_matches = argument_matches;
-        self.parameter_tys = parameter_tys;
-        self.errors = errors;
+    fn swap_snapshot(&mut self, snapshot: &mut BindingSnapshot<'db>) {
+        std::mem::swap(&mut self.return_ty, &mut snapshot.return_ty);
+        std::mem::swap(
+            &mut self.inferable_typevars,
+            &mut snapshot.inferable_typevars,
+        );
+        std::mem::swap(&mut self.inference, &mut snapshot.inference);
+        std::mem::swap(&mut self.argument_matches, &mut snapshot.argument_matches);
+        std::mem::swap(&mut self.parameter_tys, &mut snapshot.parameter_tys);
+        std::mem::swap(&mut self.errors, &mut snapshot.errors);
     }
 
     /// Returns a vector where each index corresponds to an argument position,
@@ -9613,7 +9726,14 @@ struct CallableBindingSnapshot<'db> {
     matching_overloads: Vec<(usize, BindingSnapshot<'db>)>,
 }
 
-impl CallableBindingSnapshot<'_> {
+impl<'db> CallableBindingSnapshot<'db> {
+    fn swap_with(&mut self, binding: &mut CallableBinding<'db>) {
+        std::mem::swap(&mut self.overload_result, &mut binding.overload_call_result);
+        for (index, snapshot) in &mut self.matching_overloads {
+            binding.overloads[*index].swap_snapshot(snapshot);
+        }
+    }
+
     /// Merge another expanded argument list's bindings into this snapshot. Both snapshots must
     /// originate from the same snapshotter, so their overload indexes have the same order.
     fn update(&mut self, other: &Self) {
@@ -9677,19 +9797,6 @@ impl CallableBindingSnapshotter {
                 .iter()
                 .map(|index| (*index, binding.overloads[*index].snapshot()))
                 .collect(),
-        }
-    }
-
-    /// Restores the state of the matched overload bindings from the given snapshot.
-    fn restore<'db>(
-        &self,
-        binding: &mut CallableBinding<'db>,
-        snapshot: CallableBindingSnapshot<'db>,
-    ) {
-        debug_assert_eq!(self.0.len(), snapshot.matching_overloads.len());
-        binding.overload_call_result = snapshot.overload_result;
-        for (index, snapshot) in snapshot.matching_overloads {
-            binding.overloads[index].restore(snapshot);
         }
     }
 }

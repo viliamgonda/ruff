@@ -6017,7 +6017,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             overload_candidates.push(candidate_overload_indices);
         });
 
-        let generic_arguments: SmallVec<_> = generic_arguments
+        let generic_arguments: SmallVec<[usize; 4]> = generic_arguments
             .into_iter()
             .enumerate()
             .filter_map(|(index, is_generic)| is_generic.then_some(index))
@@ -6041,30 +6041,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let should_group_literals = literal_count > MAX_LITERAL_NARROWING_TARGETS;
 
         // Enable the expression cache if we are going to perform multi-inference.
-        let teardown_expression_cache = if fixpoint_iteration_limit > 0
-            || requires_overload_evaluation(&overload_candidates)
-            || narrow_targets.len() > 1
-        {
-            self.setup_expression_cache()
-        } else {
-            false
-        };
+        let evaluate_overloads = requires_overload_evaluation(&overload_candidates);
+        let teardown_expression_cache =
+            if fixpoint_iteration_limit > 0 || evaluate_overloads || narrow_targets.len() > 1 {
+                self.setup_expression_cache()
+            } else {
+                false
+            };
 
         let mut infer_and_check_argument_types =
             |builder: &mut Self,
              arguments: &mut CallArguments<'call, 'db>,
              bindings: &mut Bindings<'db>,
              tcx| {
-                if fixpoint_iteration_limit == 0 {
+                if fixpoint_iteration_limit == 0 && !evaluate_overloads {
                     builder.infer_and_check_argument_types_simple(
                         ast_arguments.clone(),
                         arguments,
-                        &initial_argument_types,
                         infer_argument_ty,
                         bindings,
                         &constraints,
                         tcx,
-                        &overload_candidates,
                     )
                 } else {
                     builder.infer_and_check_argument_types_unified(
@@ -6076,7 +6073,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         tcx,
                         &generic_arguments,
                         fixpoint_iteration_limit,
-                        &overload_candidates,
+                        OverloadInference::Candidates(&overload_candidates),
                     )
                 }
             };
@@ -6223,81 +6220,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         result
     }
 
-    #[expect(clippy::too_many_arguments)]
-    fn infer_and_check_argument_types_simple<'call>(
+    fn infer_and_check_argument_types_simple(
         &mut self,
         ast_arguments: ArgumentsIter<'_>,
-        argument_types: &mut CallArguments<'call, 'db>,
-        baseline_argument_types: &CallArguments<'call, 'db>,
+        argument_types: &mut CallArguments<'_, 'db>,
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         bindings: &mut Bindings<'db>,
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
-        candidates: &OverloadSet,
     ) -> Result<(), CallErrorKind> {
-        let db = self.db();
-        let env = self.program_environment();
-        let requires_overload_evaluation = requires_overload_evaluation(candidates);
         let arguments_tcx = self.collect_call_arguments_type_context(
-            baseline_argument_types,
-            bindings,
-            requires_overload_evaluation.then_some(candidates),
-            constraints,
-            call_expression_tcx,
-        );
-
-        // If we are not inferring against multiple overloads, we can infer the arguments
-        // and check the binding directly.
-        if !requires_overload_evaluation {
-            self.infer_all_argument_types(
-                ast_arguments,
-                argument_types,
-                &arguments_tcx,
-                infer_argument_ty,
-                CallArgumentInferenceMode::Commit,
-            );
-
-            return bindings.check_types_impl(
-                db,
-                env,
-                constraints,
-                argument_types,
-                call_expression_tcx,
-                &self.dataclass_field_specifiers,
-                CheckTypesMode::Finalize,
-            );
-        }
-
-        // Otherwise, we first infer the argument types speculatively.
-        let mut speculative_builder = self.speculate();
-        speculative_builder.infer_all_argument_types(
-            ast_arguments.clone(),
             argument_types,
-            &arguments_tcx,
-            infer_argument_ty,
-            // If there are multiple matching overloads, we will re-infer with the final set
-            // of matching overloads after overload evaluation, and so can avoid the default
-            // inference here.
-            CallArgumentInferenceMode::Speculate,
-        );
-
-        let result = bindings.check_types_impl(
-            db,
-            env,
-            constraints,
-            argument_types,
-            call_expression_tcx,
-            &self.dataclass_field_specifiers,
-            CheckTypesMode::Finalize,
-        );
-
-        let checked_argument_types = argument_types.clone();
-        *argument_types = baseline_argument_types.clone();
-
-        // And re-infer argument types after overload evaluation, ensuring that only
-        // inferred types and diagnostics from matching overloads are preserved.
-        let arguments_tcx = self.collect_call_arguments_type_context(
-            &checked_argument_types,
             bindings,
             None,
             constraints,
@@ -6310,37 +6243,73 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             infer_argument_ty,
             CallArgumentInferenceMode::Commit,
         );
-        self.union_expected_types(&speculative_builder.expected_types);
-
-        result
+        bindings.check_types_impl(
+            self.db(),
+            self.program_environment(),
+            constraints,
+            argument_types,
+            call_expression_tcx,
+            &self.dataclass_field_specifiers,
+            CheckTypesMode::Finalize,
+        )
     }
 
     /// Infer generic call arguments under fixpoint iteration, allowing arguments to contribute
     /// type context constraints to other siblings.
+    ///
+    /// When overloads compete, infer without a declared type preference to select the matches,
+    /// then solve just those matches with their usual type context.
     #[expect(clippy::too_many_arguments)]
-    fn infer_and_check_argument_types_unified(
+    fn infer_and_check_argument_types_unified<'call>(
         &mut self,
         ast_arguments: &ArgumentsIter<'_>,
-        argument_types: &mut CallArguments<'_, 'db>,
+        argument_types: &mut CallArguments<'call, 'db>,
         infer_argument_ty: &mut dyn FnMut(&mut Self, ArgExpr<'db, '_>) -> Type<'db>,
         bindings: &mut Bindings<'db>,
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
-        generic_arguments: &SmallVec<[usize; 4]>,
+        generic_arguments: &[usize],
         fixpoint_iteration_limit: usize,
-        candidates: &OverloadSet,
+        overloads: OverloadInference<'_, 'call, 'db>,
     ) -> Result<(), CallErrorKind> {
         let db = self.db();
-        let requires_overload_evaluation = requires_overload_evaluation(candidates);
-
-        let mut arguments_tcx = self.collect_call_arguments_type_context(
-            argument_types,
-            bindings,
-            Some(candidates),
-            constraints,
-            call_expression_tcx,
-        );
-
+        let env = self.program_environment();
+        let (mode, candidates, mut arguments_tcx) = match overloads {
+            OverloadInference::Candidates(candidates) => {
+                let mode = CallArgumentInferenceMode::for_candidates(candidates);
+                let tcx = self.collect_call_arguments_type_context(
+                    argument_types,
+                    bindings,
+                    Some(candidates),
+                    constraints,
+                    mode.type_context(call_expression_tcx),
+                );
+                (mode, Some(candidates), tcx)
+            }
+            OverloadInference::Selected(matching_arguments) => {
+                // Start the final solve with the chosen annotations. Carrying over the candidate's
+                // specialization here would turn its provisional solution into argument evidence.
+                let mut selected = bindings.clone();
+                let _ = selected.finalize_argument_inference(
+                    db,
+                    env,
+                    matching_arguments,
+                    &self.dataclass_field_specifiers,
+                    None,
+                );
+                selected.clear_argument_context_inference();
+                let tcx = self.collect_call_arguments_type_context(
+                    matching_arguments,
+                    &selected,
+                    None,
+                    constraints,
+                    call_expression_tcx,
+                );
+                (CallArgumentInferenceMode::Commit, None, tcx)
+            }
+        };
+        let matching_tcx = mode.type_context(call_expression_tcx);
+        let mut result = Ok(());
         let mut iteration = 0;
         let mut next_bindings = bindings.clone();
         let mut prev_argument_types = argument_types.clone();
@@ -6355,14 +6324,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 &mut next_argument_types,
                 &arguments_tcx,
                 infer_argument_ty,
-                if requires_overload_evaluation {
-                    // If there are multiple matching overloads, we will re-infer with the final set
-                    // of matching overloads after overload evaluation, and so can avoid the default
-                    // inference here.
-                    CallArgumentInferenceMode::Speculate
-                } else {
-                    CallArgumentInferenceMode::Commit
-                },
+                mode,
             );
 
             let inferred_types_converged = next_argument_types
@@ -6376,15 +6338,25 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // Otherwise, we have to evaluate the bindings against the newly inferred types.
             next_bindings = bindings.clone();
-            let _ = next_bindings.check_types_impl(
-                db,
-                self.program_environment(),
-                constraints,
-                &next_argument_types,
-                call_expression_tcx,
-                &self.dataclass_field_specifiers,
-                CheckTypesMode::Provisional,
-            );
+            result = match overloads {
+                OverloadInference::Candidates(_) => next_bindings.check_types_impl(
+                    db,
+                    env,
+                    constraints,
+                    &next_argument_types,
+                    matching_tcx,
+                    &self.dataclass_field_specifiers,
+                    CheckTypesMode::Provisional,
+                ),
+                OverloadInference::Selected(matching_arguments) => next_bindings
+                    .finalize_argument_inference(
+                        db,
+                        env,
+                        &next_argument_types,
+                        &self.dataclass_field_specifiers,
+                        Some((matching_arguments, call_expression_tcx)),
+                    ),
+            };
 
             // The number of occurrences of inferable typevars forms an upper bound for the number
             // of fixpoint iterations, and so if the types have converged, or we have reached the
@@ -6397,9 +6369,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let next_arguments_tcx = self.collect_call_arguments_type_context(
                 &next_argument_types,
                 &next_bindings,
-                Some(candidates),
+                candidates,
                 constraints,
-                call_expression_tcx,
+                matching_tcx,
             );
 
             // If the argument constraints have converged, the inferred types will be identical,
@@ -6416,43 +6388,33 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             prev_argument_types = next_argument_types;
         };
 
-        // Discard any non-matching constructors overloads now that the inferred types have converged.
-        let result = next_bindings.finalize_argument_inference(
-            db,
-            self.program_environment(),
-            &converged_argument_types,
-            &self.dataclass_field_specifiers,
-        );
-
-        // If the set of candidate bindings contained multiple matching overloads, re-infer the argument
-        // types against the final set of matching overloads, such that only the relevant diagnostics
-        // and inferred types are preserved.
-        if requires_overload_evaluation {
-            let arguments_tcx = self.collect_call_arguments_type_context(
-                &converged_argument_types,
-                &next_bindings,
-                None,
+        *bindings = next_bindings;
+        if mode.is_evaluating_overloads() {
+            self.union_expected_types(&converged_builder.expected_types);
+            return self.infer_and_check_argument_types_unified(
+                ast_arguments,
+                argument_types,
+                infer_argument_ty,
+                bindings,
                 constraints,
                 call_expression_tcx,
+                generic_arguments,
+                fixpoint_iteration_limit,
+                OverloadInference::Selected(&converged_argument_types),
             );
-
-            self.infer_all_argument_types(
-                ast_arguments.clone(),
-                argument_types,
-                &arguments_tcx,
-                infer_argument_ty,
-                CallArgumentInferenceMode::Commit,
-            );
-
-            self.union_expected_types(&converged_builder.expected_types);
-        } else {
-            // Otherwise, we can simply use the newly inferred types.
-            *argument_types = converged_argument_types;
-            self.extend(converged_builder);
         }
-
-        *bindings = next_bindings;
-        result
+        *argument_types = converged_argument_types;
+        self.extend(converged_builder);
+        match overloads {
+            OverloadInference::Candidates(_) => bindings.finalize_argument_inference(
+                db,
+                env,
+                argument_types,
+                &self.dataclass_field_specifiers,
+                None,
+            ),
+            OverloadInference::Selected(_) => result,
+        }
     }
 
     /// Collects the type contexts used to infer the arguments of a call expression.
@@ -6476,10 +6438,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             overloads_with_binding: &mut OverloadsWithBinding<'a, 'db>,
             binding: &'a CallableBinding<'db>,
         ) {
-            let mut matching_overloads = binding.matching_overloads().peekable();
-            if matching_overloads.peek().is_some() {
+            let mut selected_overloads = binding.selected_overloads().peekable();
+            if selected_overloads.peek().is_some() {
                 overloads_with_binding.extend(
-                    matching_overloads.map(|(_, overload)| (overload, binding, OnceCell::new())),
+                    selected_overloads.map(|(_, overload)| (overload, binding, OnceCell::new())),
                 );
             } else if let Some(overload) = binding.best_failing_overload() {
                 // If there is a single overload that does not match, we still infer the argument
@@ -6605,6 +6567,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     let tcx = argument_tcx
                         .map(ArgumentTypeContext::type_context)
                         .unwrap_or_default();
+                    let tcx = mode.type_context(tcx);
                     let inferred_ty = infer_argument_ty(self, (argument_index, ast_argument, tcx));
                     insert_argument_ty(argument_index, inferred_ty, argument_tcx, argument_types);
                 }
@@ -6615,7 +6578,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     // If there are multiple applicable type contexts and we are not in
                     // speculative mode, infer the argument without type context as the
                     // default inference.
-                    if mode.requires_default_inference() {
+                    if !mode.is_evaluating_overloads() {
                         let inferred_ty = infer_argument_ty(
                             self,
                             (argument_index, ast_argument, TypeContext::default()),
@@ -6658,6 +6621,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         let tcx = argument_tcx
                             .map(ArgumentTypeContext::type_context)
                             .unwrap_or_default();
+                        let tcx = mode.type_context(tcx);
 
                         let mut speculative_builder = self.speculate();
                         let inferred_ty = infer_argument_ty(
@@ -13155,9 +13119,16 @@ impl<'args, 'call, 'db> CallArgumentInference<'args, 'call, 'db> {
 }
 
 #[derive(Clone, Copy)]
+enum OverloadInference<'a, 'call, 'db> {
+    Candidates(&'a OverloadSet),
+    /// The overloads have been selected using these argument types.
+    Selected(&'a CallArguments<'call, 'db>),
+}
+
+#[derive(Clone, Copy)]
 enum CallArgumentInferenceMode {
-    /// Infer against every candidate type context entirely speculatively.
-    Speculate,
+    /// Infer against each candidate's parameters without preferring its annotations.
+    EvaluateOverloads,
 
     /// Commit a default inference without type context, if there are multiple
     /// applicable type contexts.
@@ -13165,8 +13136,23 @@ enum CallArgumentInferenceMode {
 }
 
 impl CallArgumentInferenceMode {
-    fn requires_default_inference(self) -> bool {
-        matches!(self, Self::Commit)
+    fn for_candidates(candidates: &OverloadSet) -> Self {
+        if requires_overload_evaluation(candidates) {
+            Self::EvaluateOverloads
+        } else {
+            Self::Commit
+        }
+    }
+
+    fn type_context(self, tcx: TypeContext<'_>) -> TypeContext<'_> {
+        match self {
+            Self::EvaluateOverloads => tcx.without_preference(),
+            Self::Commit => tcx,
+        }
+    }
+
+    fn is_evaluating_overloads(self) -> bool {
+        matches!(self, Self::EvaluateOverloads)
     }
 }
 

@@ -302,10 +302,10 @@ impl Session {
                 files_changed: true,
             })
         ) {
-            let scripts = db.project().scripts_to_synchronize(db);
-            Self::synchronize_closed_scripts(
+            Self::synchronize_workspace_scripts(
                 db,
-                &scripts,
+                self.global_settings.diagnostic_mode(),
+                None,
                 client,
                 self.resolved_client_capabilities,
                 &self.script_progress,
@@ -357,15 +357,25 @@ impl Session {
         self.update_file_watcher(client);
     }
 
-    /// Requests synchronization using the scripts' saved metadata.
-    fn synchronize_closed_scripts(
+    /// Prepares closed scripts for workspace diagnostics. File events can narrow the
+    /// candidates to changed scripts. Startup and project reloads consider the whole index.
+    fn synchronize_workspace_scripts(
         db: &mut ProjectDatabase,
-        scripts: &[File],
+        diagnostic_mode: DiagnosticMode,
+        changes: Option<&ChangeResult>,
         client: &Client,
         capabilities: ResolvedClientCapabilities,
         progress: &ScriptProgress,
     ) {
-        for &file in scripts {
+        // Looking up candidates can index the entire project.
+        if !diagnostic_mode.is_workspace() {
+            return;
+        }
+        let scripts = match changes {
+            Some(changes) => changes.scripts_to_synchronize(db),
+            None => db.project().scripts_to_synchronize(db),
+        };
+        for file in scripts {
             // Open and save handle editor documents separately. Their metadata may contain
             // unsaved changes, including overlays that are not in the diagnostic open-file set.
             if db.document(file).is_some() {
@@ -556,6 +566,7 @@ impl Session {
 
         let capabilities = self.resolved_client_capabilities;
         let script_progress = self.script_progress.clone();
+        let diagnostic_mode = self.global_settings.diagnostic_mode();
         let db = self.project_db_mut(path);
         let result = db.apply_changes(changes);
         if let Some(project_path) = result.project_sync_path() {
@@ -573,8 +584,14 @@ impl Session {
                     )))
                 });
         }
-        let scripts = result.scripts_to_synchronize(db);
-        Self::synchronize_closed_scripts(db, &scripts, client, capabilities, &script_progress);
+        Self::synchronize_workspace_scripts(
+            db,
+            diagnostic_mode,
+            Some(&result),
+            client,
+            capabilities,
+            &script_progress,
+        );
         self.update_file_watcher(client);
         result
     }
@@ -675,9 +692,20 @@ impl Session {
             let global_settings = global_options.into_settings();
             self.global_settings = Arc::new(global_settings);
         }
-        if let Some(check_mode) = self.global_settings.diagnostic_mode().to_check_mode() {
+        let diagnostic_mode = self.global_settings.diagnostic_mode();
+        if let Some(check_mode) = diagnostic_mode.to_check_mode() {
             for project in self.projects.values_mut() {
-                project.db.set_check_mode(check_mode);
+                let db = &mut project.db;
+                db.set_check_mode(check_mode);
+                // A new folder's settings can enable workspace diagnostics for existing projects.
+                Self::synchronize_workspace_scripts(
+                    db,
+                    diagnostic_mode,
+                    None,
+                    client,
+                    self.resolved_client_capabilities,
+                    &self.script_progress,
+                );
             }
         }
 
@@ -821,7 +849,7 @@ impl Session {
                 ProjectDatabase::fallible(metadata.clone(), system.clone())
             });
 
-        let mut db = project.unwrap_or_else(|err| {
+        let db = project.unwrap_or_else(|err| {
             tracing::error!(
                 "Failed to load project for workspace `{uri}`: {err:#}. \
                  Continuing with valid settings"
@@ -838,14 +866,6 @@ impl Session {
         let untracked = previous
             .map(|state| state.untracked_files_with_pushed_diagnostics)
             .unwrap_or_default();
-        let scripts = db.project().scripts_to_synchronize(&db);
-        Self::synchronize_closed_scripts(
-            &mut db,
-            &scripts,
-            client,
-            self.resolved_client_capabilities,
-            &self.script_progress,
-        );
         self.projects.insert(
             root.clone(),
             ProjectState {
@@ -2245,8 +2265,8 @@ impl OpenDocumentHandle {
             } else {
                 // Restore file and script membership from the saved contents. Discarding
                 // unsaved script metadata can bring a file back into the project when
-                // `exclude-scripts` is enabled. Also request synchronization for saved
-                // metadata changes that were skipped while the editor overlay was present.
+                // `exclude-scripts` is enabled. In workspace mode, this also synchronizes
+                // saved metadata changes skipped while the editor overlay was present.
                 self.update_in_databases(session, client);
             }
         } else {

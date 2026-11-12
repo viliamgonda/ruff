@@ -13,18 +13,19 @@
 //! check is necessary because the script's dependencies and Python version must be known to
 //! produce accurate diagnostics.
 //!
-//! The language server requests synchronization for indexed scripts when opening a project,
-//! including scripts that are not open in the editor. It also requests synchronization when
-//! scripts are discovered, opened or saved, or when a file-watcher event reports a change to a
-//! closed script. Project metadata is refreshed when configuration changes.
+//! The language server synchronizes a script's environment when the script is opened or saved.
+//! With workspace diagnostics enabled, it prepares all scripts in the project at startup and
+//! resynchronizes affected scripts when the project configuration or files change on disk.
 //!
 //! These operations run in the background because synchronizing scripts can create environments
 //! and install packages. Waiting for them would increase the latency of other editor requests;
 //! for example, semantic tokens should remain available while synchronization is running.
-//! Scripts are discovered independently of diagnostics because workspace symbols and references
-//! also need their environments.
 //! This avoids a rust-analyzer-like experience where editor operations wait for `cargo check` to
 //! complete before becoming available.
+//!
+//! Workspace symbol and reference searches can inspect closed scripts without starting uv.
+//! Until a script's environment is synchronized, Find References can miss uses of packages
+//! declared in its inline metadata.
 //!
 //! While a script's initial environment is unavailable, the language server defers its semantic
 //! diagnostics to avoid incorrect missing-dependency errors. Document pull requests receive an

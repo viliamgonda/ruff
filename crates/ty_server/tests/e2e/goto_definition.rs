@@ -495,7 +495,10 @@ from idna import encode
 "#;
 
         let mut server = TestServerBuilder::new()?
-            .with_workspace(workspace_root, None)?
+            .with_workspace(
+                workspace_root,
+                Some(ClientOptions::default().with_diagnostic_mode(DiagnosticMode::Workspace)),
+            )?
             .with_file(script, initial)?
             .with_real_uv(UseUv::Scripts)?
             .enable_workspace_diagnostic_refresh(true)

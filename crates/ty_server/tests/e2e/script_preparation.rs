@@ -11,32 +11,64 @@ use ty_server::{ClientOptions, DiagnosticMode};
 use crate::TestServerBuilder;
 use crate::diagnostic_snapshots::condensed_workspace_diagnostic_snapshot;
 
+#[cfg(feature = "test-uv")]
+const SCRIPT: &str = r#"# /// script
+# requires-python = ">=3.12"
+# dependencies = ["attrs==25.4.0"]
+# ///
+import attrs
+missing
+"#;
+
+#[cfg(feature = "test-uv")]
+fn script_workspace_builder(mode: DiagnosticMode) -> Result<TestServerBuilder> {
+    workspace_builder(mode)?
+        .with_file("src/main.py", "ordinary_missing")?
+        .with_file("src/script.py", SCRIPT)?
+        .with_real_uv(UseUv::Scripts)
+}
+
 #[test]
 #[cfg(feature = "test-uv")]
-fn closed_scripts_are_prepared_at_startup() -> Result<()> {
+fn closed_scripts_wait_for_open_without_workspace_diagnostics() -> Result<()> {
     let ordinary = SystemPath::new("src/main.py");
     let script = SystemPath::new("src/script.py");
-    let mut server = workspace_builder()?
-        .with_file(ordinary, "ordinary_missing")?
-        .with_file(
-            script,
-            dedent(
-                r#"
-                # /// script
-                # requires-python = ">=3.12"
-                # dependencies = []
-                # ///
-                missing
-                "#,
-            ),
-        )?
-        .with_real_uv(UseUv::Scripts)?
-        .enable_workspace_diagnostic_refresh(true)
+    let attrs = lsp_types::Position::new(4, 7);
+    for mode in [DiagnosticMode::OpenFilesOnly, DiagnosticMode::Off] {
+        let mut server = script_workspace_builder(mode)?
+            .enable_workspace_diagnostic_refresh(true)
+            .enable_work_done_progress(true)
+            .build()
+            .wait_until_workspaces_are_initialized();
+
+        server.open_text_document(ordinary, "ordinary_missing", 1);
+        // The lookup indexes the closed script before the configuration reload.
+        assert!(server.goto_definition_request(script, attrs).is_none());
+        server.write_file("src/ty.toml", "[environment]\npython-version = '3.12'")?;
+        server.did_change_watched_file("src/ty.toml", lsp_types::FileChangeType::Created);
+        server.await_diagnostic_refresh();
+        // A round trip lets the main loop send any progress requests queued by the reload.
+        server.document_diagnostic_request(ordinary, None);
+        server.assert_no_pending_messages();
+
+        server.open_text_document(script, SCRIPT, 1);
+        server.assert_work_done_progress("Synchronizing scripts")?;
+        server.await_diagnostic_refresh();
+        assert!(
+            server.goto_definition_request(script, attrs).is_some(),
+            "opening the script should make attrs available in {mode:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "test-uv")]
+fn workspace_diagnostics_prepare_a_closed_script() -> Result<()> {
+    let mut server = script_workspace_builder(DiagnosticMode::Workspace)?
         .build()
         .wait_until_workspaces_are_initialized();
 
-    // Closed scripts are initialized without a document-open notification.
-    server.await_diagnostic_refresh();
     let report = server.workspace_diagnostic_request(None, None);
     assert_snapshot!(condensed_workspace_diagnostic_snapshot(report), @"
     file://<temp_dir>/src/main.py
@@ -51,7 +83,7 @@ fn closed_scripts_are_prepared_at_startup() -> Result<()> {
 #[cfg(feature = "test-uv")]
 fn created_closed_script_is_prepared_after_a_file_event() -> Result<()> {
     let script = SystemPath::new("src/script.py");
-    let mut server = workspace_builder()?
+    let mut server = workspace_builder(DiagnosticMode::Workspace)?
         .with_real_uv(UseUv::Scripts)?
         .enable_workspace_diagnostic_refresh(true)
         .build()
@@ -97,7 +129,7 @@ fn exclude_scripts_uses_saved_contents_after_close() -> Result<()> {
         unsaved_missing
         ",
     );
-    let mut server = workspace_builder()?
+    let mut server = workspace_builder(DiagnosticMode::Workspace)?
         .with_file(
             "src/ty.toml",
             r"
@@ -139,7 +171,7 @@ fn exclude_scripts_uses_saved_contents_after_close() -> Result<()> {
 fn non_python_overlay_does_not_block_workspace_diagnostics() -> Result<()> {
     let script = SystemPath::new("src/script.py");
     let main = SystemPath::new("src/main.py");
-    let mut server = workspace_builder()?
+    let mut server = workspace_builder(DiagnosticMode::Workspace)?
         .with_file(script, "pass\n")?
         .with_file(main, "missing\n")?
         .with_use_uv(UseUv::Scripts)
@@ -173,9 +205,9 @@ fn non_python_overlay_does_not_block_workspace_diagnostics() -> Result<()> {
     Ok(())
 }
 
-fn workspace_builder() -> Result<TestServerBuilder> {
+fn workspace_builder(mode: DiagnosticMode) -> Result<TestServerBuilder> {
     TestServerBuilder::new()?.with_workspace(
         SystemPath::new("src"),
-        Some(ClientOptions::default().with_diagnostic_mode(DiagnosticMode::Workspace)),
+        Some(ClientOptions::default().with_diagnostic_mode(mode)),
     )
 }

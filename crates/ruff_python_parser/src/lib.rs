@@ -670,7 +670,9 @@ impl std::fmt::Display for ModeParseError {
 
 #[cfg(test)]
 mod tests {
-    use ruff_python_ast::comparable::ComparableMod;
+    use std::hash::{BuildHasher, RandomState};
+
+    use ruff_python_ast::comparable::{ComparableExpr, ComparableMod};
     use ruff_python_ast::helpers::ReturnStatementVisitor;
     use ruff_python_ast::kind;
     use ruff_python_ast::{
@@ -680,6 +682,50 @@ mod tests {
     use ruff_text_size::Ranged;
 
     use super::{ParseError, parse_expression, parse_module, parse_unchecked_source};
+
+    #[test]
+    fn call_visitor_evaluates_positional_arguments_before_keywords() -> Result<(), ParseError> {
+        #[derive(Default)]
+        struct ArgumentOrder(Vec<ruff_text_size::TextRange>);
+
+        impl ruff_python_ast::visitor::Visitor<'_> for ArgumentOrder {
+            fn visit_expr(&mut self, expr: Expr<'_>) {
+                self.0.push(expr.range());
+            }
+            fn visit_keyword(&mut self, keyword: ruff_python_ast::Keyword<'_>) {
+                self.0.push(keyword.range());
+            }
+        }
+
+        let source = "f(first, key=second, *third, **fourth)";
+        let parsed = parse_expression(source)?;
+        let call = parsed.expr().as_call_expr().unwrap();
+        let mut order = ArgumentOrder::default();
+        ruff_python_ast::visitor::walk_arguments(&mut order, call.arguments());
+        assert_eq!(
+            order
+                .0
+                .into_iter()
+                .map(|range| &source[range])
+                .collect::<Vec<_>>(),
+            ["first", "*third", "key=second", "**fourth"],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn comparable_call_arguments_follow_evaluation_order() -> Result<(), ParseError> {
+        let interleaved = parse_expression("f(a, key=1, *xs, other=2)")?;
+        let grouped = parse_expression("f(a, *xs, key=1, other=2)")?;
+        let reordered_keywords = parse_expression("f(a, *xs, other=2, key=1)")?;
+        let interleaved = ComparableExpr::from(interleaved.expr());
+        let grouped = ComparableExpr::from(grouped.expr());
+        assert_eq!(interleaved, grouped);
+        assert_ne!(interleaved, ComparableExpr::from(reordered_keywords.expr()));
+        let hasher = RandomState::new();
+        assert_eq!(hasher.hash_one(interleaved), hasher.hash_one(grouped));
+        Ok(())
+    }
 
     #[test]
     fn copying_relocated_call_arguments_preserves_source_order() -> Result<(), ParseError> {
@@ -837,6 +883,49 @@ mod tests {
                         .eq(["key=1", "value=2"])
                 );
             }
+        }
+    }
+
+    #[test]
+    fn copied_parameters_keep_roles_when_children_share_a_range() {
+        let parsed = parse_unchecked_source("def f(x): pass", PySourceType::Python);
+        let parameters = parsed
+            .root()
+            .descendants()
+            .find_map(AstNode::cast::<ruff_python_ast::Parameters>)
+            .unwrap();
+        let mut builder = Builder::default();
+        let x = builder.copy_node(parameters.args().next().unwrap());
+        let items = builder.parameter_items([
+            ruff_python_ast::ParameterItem::KeywordOnly(x),
+            ruff_python_ast::ParameterItem::PositionalOnly(x),
+        ]);
+        let root = builder.add(build::Parameters {
+            range: parameters.range(),
+            items,
+        });
+        let swapped = builder.parameter_items([
+            ruff_python_ast::ParameterItem::PositionalOnly(x),
+            ruff_python_ast::ParameterItem::KeywordOnly(x),
+        ]);
+        let other = builder.add(build::Parameters {
+            range: parameters.range(),
+            items: swapped,
+        });
+        assert_ne!(builder.get(root).items(), builder.get(other).items());
+        let source = builder.finish_tree(root);
+        let mut builder = Builder::default();
+        let copy = builder.copy_node(source.root());
+        let copied = builder.finish_tree(copy);
+        for node in [source.root(), copied.root()] {
+            let mut items = node.items().iter();
+            assert!(
+                matches!(items.next(), Some(ruff_python_ast::ParameterItem::KeywordOnly(p)) if p.name() == "x")
+            );
+            assert!(
+                matches!(items.next(), Some(ruff_python_ast::ParameterItem::PositionalOnly(p)) if p.name() == "x")
+            );
+            assert!(items.next().is_none());
         }
     }
 

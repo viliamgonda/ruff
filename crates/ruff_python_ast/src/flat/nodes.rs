@@ -228,10 +228,10 @@ impl<'a> IntoIterator for StringValue<'a> {
 
 impl crate::Arguments<'_> {
     pub fn len(self) -> usize {
-        self.args().len() + self.keywords().len()
+        self.items().len()
     }
     pub fn is_empty(self) -> bool {
-        self.args().is_empty() && self.keywords().is_empty()
+        self.items().is_empty()
     }
 }
 
@@ -243,14 +243,6 @@ pub enum AnyParameter<'a> {
 
 impl<'a> AnyParameter<'a> {
     #[inline]
-    fn from_syntax_node(node: super::SyntaxNode<'a>) -> Self {
-        if let Some(parameter) = node.cast::<Parameter>() {
-            Self::Variadic(parameter)
-        } else {
-            Self::NonVariadic(node.retype())
-        }
-    }
-
     pub fn as_parameter(self) -> Parameter<'a> {
         match self {
             Self::Variadic(node) => node,
@@ -284,37 +276,117 @@ impl Ranged for AnyParameter<'_> {
     }
 }
 
+impl<'a> crate::ParameterItem<ParameterWithDefault<'a>, Parameter<'a>> {
+    pub fn into_parameter(self) -> AnyParameter<'a> {
+        match self {
+            Self::PositionalOnly(p) | Self::PositionalOrKeyword(p) | Self::KeywordOnly(p) => {
+                AnyParameter::NonVariadic(p)
+            }
+            Self::Vararg(p) | Self::Kwarg(p) => AnyParameter::Variadic(p),
+        }
+    }
+}
+
 impl<'a> crate::Parameters<'a> {
-    pub fn iter_source_order(self) -> impl Iterator<Item = AnyParameter<'a>> {
-        self.ordered_items()
-            .iter()
-            .map(AnyParameter::from_syntax_node)
+    pub fn posonlyargs(self) -> impl DoubleEndedIterator<Item = ParameterWithDefault<'a>> + Clone {
+        self.items()
+            .matching(|role| role == super::ParameterItems::POSITIONAL_ONLY)
+    }
+
+    pub fn args(self) -> impl DoubleEndedIterator<Item = ParameterWithDefault<'a>> + Clone {
+        self.items()
+            .matching(|role| role == super::ParameterItems::POSITIONAL_OR_KEYWORD)
+    }
+
+    pub fn kwonlyargs(self) -> impl DoubleEndedIterator<Item = ParameterWithDefault<'a>> + Clone {
+        self.items()
+            .matching(|role| role == super::ParameterItems::KEYWORD_ONLY)
+    }
+
+    pub fn vararg(self) -> Option<crate::Parameter<'a>> {
+        self.items()
+            .matching(|role| role == super::ParameterItems::VARARG)
+            .next()
+    }
+
+    pub fn kwarg(self) -> Option<crate::Parameter<'a>> {
+        self.items()
+            .matching(|role| role == super::ParameterItems::KWARG)
+            .next_back()
+    }
+
+    /// Positional-only and positional-or-keyword parameters, in argument-binding order.
+    pub fn iter_positional_params(
+        self,
+    ) -> impl DoubleEndedIterator<Item = ParameterWithDefault<'a>> + Clone {
+        self.items().matching(|role| {
+            matches!(
+                role,
+                super::ParameterItems::POSITIONAL_ONLY
+                    | super::ParameterItems::POSITIONAL_OR_KEYWORD
+            )
+        })
+    }
+
+    /// Parameters which can have defaults, including keyword-only parameters.
+    pub fn iter_non_variadic_params(
+        self,
+    ) -> impl DoubleEndedIterator<Item = ParameterWithDefault<'a>> {
+        self.items().matching(|role| {
+            matches!(
+                role,
+                super::ParameterItems::POSITIONAL_ONLY
+                    | super::ParameterItems::POSITIONAL_OR_KEYWORD
+                    | super::ParameterItems::KEYWORD_ONLY
+            )
+        })
+    }
+
+    pub fn find(self, name: &str) -> Option<ParameterWithDefault<'a>> {
+        self.iter_non_variadic_params()
+            .find(|p| p.parameter().name().as_str() == name)
     }
 
     pub fn index(self, name: &str) -> Option<usize> {
-        self.posonlyargs()
-            .iter()
-            .chain(self.args())
-            .chain(self.kwonlyargs())
-            .position(|parameter| parameter.name() == name)
+        self.iter_non_variadic_params()
+            .position(|p| p.parameter().name().as_str() == name)
     }
 
-    pub fn includes(self, name: &str) -> bool {
-        self.iter().any(|param| param.name() == name)
-    }
-    #[inline]
-    pub fn iter(self) -> impl DoubleEndedIterator<Item = AnyParameter<'a>> {
-        self.grouped_items()
+    /// Iterates parameters in source order, including in recovered syntax.
+    pub fn iter_source_order(
+        self,
+    ) -> impl DoubleEndedIterator<Item = AnyParameter<'a>>
+    + ExactSizeIterator
+    + std::iter::FusedIterator
+    + Clone {
+        self.items()
             .iter()
-            .map(AnyParameter::from_syntax_node)
+            .map(crate::ParameterItem::into_parameter)
+    }
+
+    /// Iterates parameters in argument-binding order.
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = AnyParameter<'a>> {
+        self.iter_positional_params()
+            .map(AnyParameter::NonVariadic)
+            .chain(
+                std::iter::once_with(move || self.vararg().map(AnyParameter::Variadic)).flatten(),
+            )
+            .chain(self.kwonlyargs().map(AnyParameter::NonVariadic))
+            .chain(std::iter::once_with(move || self.kwarg().map(AnyParameter::Variadic)).flatten())
     }
 
     pub fn len(self) -> usize {
-        self.ordered_items().len()
+        self.items().len()
     }
 
     pub fn is_empty(self) -> bool {
-        self.ordered_items().is_empty()
+        self.items().is_empty()
+    }
+
+    pub fn includes(self, name: &str) -> bool {
+        self.items()
+            .iter()
+            .any(|item| item.into_parameter().name() == name)
     }
 }
 
@@ -398,6 +470,16 @@ impl<'a> crate::PatternMatchMapping<'a> {
     /// The final `**name` capture. Valid mapping patterns contain at most one.
     pub fn rest(self) -> Option<Identifier<'a>> {
         self.items().rest()
+    }
+}
+
+impl<'a> crate::PatternArguments<'a> {
+    pub fn patterns(self) -> super::FilteredNodes<'a, crate::kind::Pattern> {
+        super::FilteredNodes::new(self.items())
+    }
+
+    pub fn keywords(self) -> super::FilteredNodes<'a, crate::kind::PatternKeyword> {
+        super::FilteredNodes::new(self.items())
     }
 }
 
@@ -526,13 +608,13 @@ impl crate::Pattern<'_> {
 }
 
 impl<'a> crate::StmtClassDef<'a> {
-    pub fn bases(self) -> List<'a, AstNodeId<crate::kind::Expr>> {
+    pub fn bases(self) -> super::FilteredNodes<'a, crate::kind::Expr> {
         self.arguments()
-            .map_or_else(|| List::new(self.syntax.ast, 0), crate::Arguments::args)
+            .map_or_else(Default::default, crate::Arguments::args)
     }
-    pub fn keywords(self) -> List<'a, AstNodeId<crate::kind::Keyword>> {
+    pub fn keywords(self) -> super::FilteredNodes<'a, crate::kind::Keyword> {
         self.arguments()
-            .map_or_else(|| List::new(self.syntax.ast, 0), crate::Arguments::keywords)
+            .map_or_else(Default::default, crate::Arguments::keywords)
     }
 }
 impl<'a> crate::ExprStringLiteral<'a> {
@@ -565,11 +647,20 @@ impl<'a> crate::ExprTuple<'a> {
         self.elts().iter()
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum ArgOrKeyword<'a> {
     Arg(Expr<'a>),
     Keyword(crate::Keyword<'a>),
 }
+impl std::fmt::Debug for ArgOrKeyword<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Arg(expr) => f.debug_tuple("Positional").field(expr).finish(),
+            Self::Keyword(kw) => f.debug_tuple("Keyword").field(kw).finish(),
+        }
+    }
+}
+
 impl<'a> ArgOrKeyword<'a> {
     pub fn value(self) -> Expr<'a> {
         match self {
@@ -603,7 +694,15 @@ impl Ranged for ArgOrKeyword<'_> {
 }
 impl<'a> crate::Arguments<'a> {
     pub fn iter_source_order(self) -> ArgumentsSourceOrder<'a> {
-        ArgumentsSourceOrder(self.ordered_items().iter())
+        self.items().iter()
+    }
+
+    pub fn args(self) -> super::FilteredNodes<'a, crate::kind::Expr> {
+        super::FilteredNodes::new(self.items())
+    }
+
+    pub fn keywords(self) -> super::FilteredNodes<'a, crate::kind::Keyword> {
+        super::FilteredNodes::new(self.items())
     }
     pub fn find_argument(self, name: &str, position: usize) -> Option<ArgOrKeyword<'a>> {
         self.find_argument_as(name, position, ArgOrKeyword::Keyword, ArgOrKeyword::Arg)
@@ -712,33 +811,7 @@ impl fmt::Debug for BytesValue<'_> {
 }
 
 /// Call arguments in their order in the source.
-#[derive(Clone)]
-pub struct ArgumentsSourceOrder<'a>(super::list::Iter<'a, AstNodeId<crate::kind::Any>>);
-
-impl<'a> Iterator for ArgumentsSourceOrder<'a> {
-    type Item = ArgOrKeyword<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.nth(0)
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.0.nth(n).map(|node| {
-            if let Some(keyword) = node.cast::<crate::Keyword>() {
-                ArgOrKeyword::Keyword(keyword)
-            } else {
-                ArgOrKeyword::Arg(node.retype())
-            }
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0.size_hint()
-    }
-}
-
-impl ExactSizeIterator for ArgumentsSourceOrder<'_> {}
-impl std::iter::FusedIterator for ArgumentsSourceOrder<'_> {}
+pub type ArgumentsSourceOrder<'a> = super::ListIter<'a, super::ArgumentId>;
 
 impl crate::ExprName<'_> {
     pub fn is_invalid(self) -> bool {
@@ -948,13 +1021,6 @@ impl PartialEq<str> for StringValue<'_> {
 impl PartialEq<&str> for StringValue<'_> {
     fn eq(&self, rhs: &&str) -> bool {
         self.to_str() == *rhs
-    }
-}
-
-impl<'a> crate::Parameters<'a> {
-    pub fn find(self, name: &str) -> Option<ParameterWithDefault<'a>> {
-        self.iter_non_variadic_params()
-            .find(|parameter| parameter.parameter().name().as_str() == name)
     }
 }
 

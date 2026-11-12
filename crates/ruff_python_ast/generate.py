@@ -51,6 +51,7 @@ types_requiring_crate_prefix = {
     "CmpOp",
     "Comprehension",
     "MappingPatternItems",
+    "ParameterItems",
     "UnaryOp",
     "BoolOp",
     "Operator",
@@ -242,13 +243,13 @@ def field_codec(field: Field, nodes: set[str]) -> WireField:
     ) -> WireField:
         return WireField(name, width, result, build_type or result, encode, read)
 
-    if inner == "MappingPatternItems":
+    if inner in {"MappingPatternItems", "ParameterItems"}:
         return codec(
             8,
-            "crate::flat::MappingPatternItems<'a>",
+            f"crate::flat::{inner}<'a>",
             f"{value}.word()",
-            "super::MappingPatternItems(List::new(self.syntax.ast, word))",
-            build_type="super::super::MappingPatternItemsId",
+            f"super::{inner}(List::new(self.syntax.ast, word))",
+            build_type=f"super::super::{inner}Id",
         )
     if field.is_list or inner in PARTS:
         item = PARTS.get(inner, inner)
@@ -448,7 +449,17 @@ def child_fields(node: Node, nodes: set[str]) -> list[Field]:
     return [
         field
         for field in source_order_fields(node)
-        if (field.ty in nodes or field.ty in PARTS or field.ty == "MappingPatternItems")
+        if (
+            field.ty in nodes
+            or field.ty in PARTS
+            or field.ty
+            in {
+                "ArgumentId",
+                "MappingPatternItems",
+                "ParameterItems",
+                "PatternArgumentId",
+            }
+        )
     ]
 
 
@@ -458,8 +469,6 @@ def child_sources(
     """The source-ordered fields, each containing a handle or a list."""
     if not fields:
         return []
-    if node.name in {"Arguments", "PatternArguments", "Parameters"}:
-        return [("list", f"{view}.ordered_items().words()")]
     result = []
     for field in fields:
         raw = words[field.name].replace("self.syntax.ast.extra_word", "self.extra_word")
@@ -471,7 +480,17 @@ def child_sources(
                     f"{view}.format_spec().map_or(&[][..], |spec| spec.elements().words())",
                 )
             )
-        elif field.is_list or field.ty in PARTS or field.ty == "MappingPatternItems":
+        elif (
+            field.is_list
+            or field.ty in PARTS
+            or field.ty
+            in {
+                "ArgumentId",
+                "MappingPatternItems",
+                "ParameterItems",
+                "PatternArgumentId",
+            }
+        ):
             result.append(
                 (
                     "list",
@@ -615,34 +634,30 @@ def walk_fields(node: Node, nodes: set[str]) -> str:
     """Visit the fields of a projected node in Python source order."""
     if node.name == "Arguments":
         return """
-        if node.keywords().is_empty() {
-            for arg in node.args() { visitor.visit_expr(arg); }
-        } else if node.args().is_empty() {
-            for keyword in node.keywords() { visitor.visit_keyword(keyword); }
-        } else {
-            for argument in node.iter_source_order() {
-                match argument {
-                    super::ArgOrKeyword::Arg(expr) => visitor.visit_expr(expr),
-                    super::ArgOrKeyword::Keyword(keyword) => visitor.visit_keyword(keyword),
-                }
+        for argument in node.items() {
+            match argument {
+                super::ArgOrKeyword::Arg(expr) => visitor.visit_expr(expr),
+                super::ArgOrKeyword::Keyword(keyword) => visitor.visit_keyword(keyword),
             }
         }
         """
-    if node.name in {"PatternArguments", "PatternMatchMapping"}:
+    if node.name == "PatternArguments":
+        return """
+        for argument in node.items() {
+            match argument {
+                crate::PatternOrKeyword::Pattern(pattern) => visitor.visit_pattern(pattern),
+                crate::PatternOrKeyword::Keyword(keyword) => visitor.visit_pattern_keyword(keyword),
+            }
+        }
+        """
+    if node.name == "PatternMatchMapping":
         return "for child in node.children() { child.dispatch(visitor); }"
     if node.name == "Parameters":
         return """
-        if node.has_only_regular_args() {
-            for parameter in node.ordered_items() {
-                let parameter = parameter.retype::<crate::ParameterWithDefault>();
-                visitor.visit_parameter_with_default(parameter);
-            }
-        } else {
-            for parameter in node.iter_source_order() {
-                match parameter {
-                    super::AnyParameter::NonVariadic(node) => { visitor.visit_parameter_with_default(node); }
-                    super::AnyParameter::Variadic(node) => visitor.visit_parameter(node),
-                }
+        for parameter in node.iter_source_order() {
+            match parameter {
+                super::AnyParameter::NonVariadic(node) => { visitor.visit_parameter_with_default(node); }
+                super::AnyParameter::Variadic(node) => visitor.visit_parameter(node),
             }
         }
         """
@@ -692,12 +707,22 @@ def copy_field(field: Field, nodes: set[str]) -> str:
     """Build a field from a view into a different arena."""
     inner = field.ty
     value = f"node.{field.name}()"
-    if inner == "MappingPatternItems":
+    if inner in {"MappingPatternItems", "ParameterItems"}:
         return f"{value}.copy_to(self, rewriter)"
     if field.is_list or inner in PARTS:
         item = PARTS.get(inner, inner)
         if item in nodes:
             return f"self.map_list({value}, |b, child| b.copy_with(child, rewriter))"
+        if item == "ArgumentId":
+            return f"""self.map_list({value}, |b, item| match item {{
+                super::ArgOrKeyword::Arg(v) => super::ArgumentId::Positional(b.copy_with(v, rewriter)),
+                super::ArgOrKeyword::Keyword(v) => super::ArgumentId::Keyword(b.copy_with(v, rewriter)),
+            }})"""
+        if item == "PatternArgumentId":
+            return f"""self.map_list({value}, |b, item| match item {{
+                crate::PatternOrKeyword::Pattern(v) => crate::PatternOrKeyword::Pattern(b.copy_with(v, rewriter)),
+                crate::PatternOrKeyword::Keyword(v) => crate::PatternOrKeyword::Keyword(b.copy_with(v, rewriter)),
+            }})"""
         if item == "FStringPart":
             return f"""self.map_list({value}, |b, part| match part {{
                 super::FStringPartView::Literal(v) => super::FStringPartId::Literal(b.copy_with(v, rewriter)),
@@ -1076,62 +1101,6 @@ def generate_flat(ast: Ast) -> tuple[str, str]:
         initializers.append(
             f"(builder.{method}(self.range, [{parameters}]), self.range, crate::NodeKind::{n.name}) }} }}"
         )
-        if n.name == "Parameters":
-            schemas[n.name] = [InlineField("items", 0, 8), InlineField("layout", 8, 4)]
-            out.append(f"self.parameters_from_groups(range, [{parameters}]) }} }}")
-            out.append("impl<'a> crate::Parameters<'a> {")
-            out.append(
-                "#[inline] pub(super) fn ordered_items(self) -> NodeList<'a, crate::kind::Any> { List::new(self.syntax.ast, self.syntax.row.parameters_items()) }"
-            )
-            for f, read in zip(
-                fields,
-                [
-                    "parameter_group::<0>",
-                    "parameter_group::<1>",
-                    "variadic_parameter::<false>",
-                    "parameter_group::<2>",
-                    "variadic_parameter::<true>",
-                ],
-            ):
-                out.append(
-                    f"#[inline] pub fn {f.name}(self) -> {f.result} {{ let word = self.{read}(); {f.read} }}"
-                )
-            out.append("}")
-            continue
-        if n.name in {"Arguments", "PatternArguments"}:
-            schemas[n.name] = [
-                InlineField("keyword_group", 0, 8),
-                InlineField("positional_len", 8, 4),
-                InlineField("interleaved", 12, 1),
-            ]
-            first, second = fields
-            out.append(f"""
-                let groups = self.ordered_argument_lists({parameters});
-                self.{method}_parts(range, groups)
-                }}
-                #[inline] fn {method}_parts(&mut self, range: ruff_text_size::TextRange, (keywords, positional, interleaved): (u64, u32, bool)) -> BuildId<crate::kind::{n.name}> {{
-                let mut row = Row::new(NodeKind::{n.name}, range);
-                row.set_{arm}_keyword_group(keywords);
-                row.set_{arm}_positional_len(positional);
-                row.set_{arm}_interleaved(u8::from(interleaved));
-                self.push(row) }} }}
-                impl<'a> crate::{n.name}<'a> {{
-                #[inline] pub(super) fn ordered_items(self) -> NodeList<'a, crate::kind::Any> {{
-                    List::new(self.syntax.ast, super::ordered::argument_items(self.syntax.row.{arm}_keyword_group(), self.syntax.row.{arm}_positional_len(), self.syntax.row.{arm}_interleaved()))
-                }}""")
-            for f, raw in [
-                (
-                    first,
-                    f"super::list::Interval::preceding(self.syntax.row.{arm}_keyword_group(), u64::from(self.syntax.row.{arm}_positional_len()))",
-                ),
-                (second, f"self.syntax.row.{arm}_keyword_group()"),
-            ]:
-                out.append(f"""#[inline] pub fn {f.name}(self) -> {f.result} {{
-                    let word = {raw};
-                    {f.read}
-                }}""")
-            out.append("}")
-            continue
         mutable = "mut " if fields else ""
         out.append(f"let {mutable}row = Row::new(NodeKind::{n.name}, range);")
         if paired_lists:
@@ -1290,18 +1259,6 @@ def generate_flat(ast: Ast) -> tuple[str, str]:
         "impl Builder { pub(super) fn copy_any<R: super::Rewriter + ?Sized>(&mut self, node: super::SyntaxNode<'_>, rewriter: &mut R) -> BuildId<crate::kind::Any> { match node.classify() {"
     )
     for node in ast.all_nodes:
-        if node.name in {"Arguments", "PatternArguments"}:
-            arm = to_snake_case(node.name)
-            first, second = node.fields
-            keyword_kind = "Keyword" if node.name == "Arguments" else "PatternKeyword"
-            out.append(f"""AnyNode::{node.name}(node) => {{
-                let first = {copy_field(first, nodes)};
-                let second = {copy_field(second, nodes)};
-                let template = (node.syntax.row.{arm}_interleaved() != 0).then(|| node.ordered_items());
-                let groups = self.copy_argument_order(first.word(), second.word(), template, NodeKind::{keyword_kind});
-                self.push_{arm}_parts(node.range(), groups).cast()
-            }},""")
-            continue
         fields = [f"{field.name}: {copy_field(field, nodes)}," for field in node.fields]
         out.append(
             f"AnyNode::{node.name}(node) => build::{node.name} {{ range: node.range(), "

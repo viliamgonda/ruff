@@ -283,9 +283,7 @@ node_payloads! {
         elements: u64 at 0 => interpolated_string_format_spec_elements, set_interpolated_string_format_spec_elements;
     }
     PatternArguments(pattern_arguments) {
-        keyword_group: u64 at 0 => pattern_arguments_keyword_group, set_pattern_arguments_keyword_group;
-        positional_len: u32 at 8 => pattern_arguments_positional_len, set_pattern_arguments_positional_len;
-        interleaved: u8 at 12 => pattern_arguments_interleaved, set_pattern_arguments_interleaved;
+        items: u64 at 0 => pattern_arguments_items, set_pattern_arguments_items;
     }
     PatternKeyword(pattern_keyword) {
         attr: u32 at 0 => pattern_keyword_attr, set_pattern_keyword_attr;
@@ -298,13 +296,10 @@ node_payloads! {
         is_async: u8 at 12 => comprehension_is_async, set_comprehension_is_async;
     }
     Arguments(arguments) {
-        keyword_group: u64 at 0 => arguments_keyword_group, set_arguments_keyword_group;
-        positional_len: u32 at 8 => arguments_positional_len, set_arguments_positional_len;
-        interleaved: u8 at 12 => arguments_interleaved, set_arguments_interleaved;
+        items: u64 at 0 => arguments_items, set_arguments_items;
     }
     Parameters(parameters) {
         items: u64 at 0 => parameters_items, set_parameters_items;
-        layout: u32 at 8 => parameters_layout, set_parameters_layout;
     }
     Parameter(parameter) {
         name: u32 at 0 => parameter_name, set_parameter_name;
@@ -394,6 +389,9 @@ impl super::Ast {
             | NodeKind::PatternMatchMapping
             | NodeKind::PatternMatchOr
             | NodeKind::InterpolatedStringFormatSpec
+            | NodeKind::PatternArguments
+            | NodeKind::Arguments
+            | NodeKind::Parameters
             | NodeKind::TypeParams
             | NodeKind::FString
             | NodeKind::TString => Children::rows(
@@ -516,20 +514,6 @@ impl super::Ast {
                     .format_spec()
                     .map_or(&[][..], |spec| spec.elements().words()),
                 None,
-            ),
-            NodeKind::PatternArguments => Children::rows(
-                self,
-                node.retype::<crate::PatternArguments>()
-                    .ordered_items()
-                    .words(),
-            ),
-            NodeKind::Arguments => Children::rows(
-                self,
-                node.retype::<crate::Arguments>().ordered_items().words(),
-            ),
-            NodeKind::Parameters => Children::rows(
-                self,
-                node.retype::<crate::Parameters>().ordered_items().words(),
             ),
             NodeKind::ElifElseClause => Children::sequence(
                 self,
@@ -839,6 +823,9 @@ impl super::Ast {
             | NodeKind::PatternMatchMapping
             | NodeKind::PatternMatchOr
             | NodeKind::InterpolatedStringFormatSpec
+            | NodeKind::PatternArguments
+            | NodeKind::Arguments
+            | NodeKind::Parameters
             | NodeKind::TypeParams
             | NodeKind::FString
             | NodeKind::TString => stack.descend_list(
@@ -1153,11 +1140,6 @@ impl super::Ast {
                 }
                 split_words(record.inline_word::<0, 4>())[0]
             }
-            NodeKind::PatternArguments => stack.descend_list(
-                node.retype::<crate::PatternArguments>()
-                    .ordered_items()
-                    .words(),
-            ),
             NodeKind::Comprehension => {
                 stack.push_list(
                     List::<AstNodeId<crate::kind::Any>>::new(self, {
@@ -1168,12 +1150,6 @@ impl super::Ast {
                 );
                 stack.push_node(split_words(record.inline_word::<8, 4>())[0]);
                 split_words(record.inline_word::<4, 4>())[0]
-            }
-            NodeKind::Arguments => {
-                stack.descend_list(node.retype::<crate::Arguments>().ordered_items().words())
-            }
-            NodeKind::Parameters => {
-                stack.descend_list(node.retype::<crate::Parameters>().ordered_items().words())
             }
             NodeKind::MatchCase => {
                 stack.push_list(

@@ -4056,8 +4056,7 @@ impl std::fmt::Debug for crate::PatternArguments<'_> {
         f.debug_struct("PatternArguments")
             .field("range", &v.range())
             .field("node_index", &v.node_index())
-            .field("patterns", &v.patterns())
-            .field("keywords", &v.keywords())
+            .field("items", &v.items())
             .finish()
     }
 }
@@ -4066,47 +4065,17 @@ impl Builder {
     fn push_pattern_arguments(
         &mut self,
         range: ruff_text_size::TextRange,
-        [patterns, keywords]: [u64; 2],
-    ) -> BuildId<crate::kind::PatternArguments> {
-        let groups = self.ordered_argument_lists(patterns, keywords);
-        self.push_pattern_arguments_parts(range, groups)
-    }
-    #[inline]
-    fn push_pattern_arguments_parts(
-        &mut self,
-        range: ruff_text_size::TextRange,
-        (keywords, positional, interleaved): (u64, u32, bool),
+        [items]: [u64; 1],
     ) -> BuildId<crate::kind::PatternArguments> {
         let mut row = Row::new(NodeKind::PatternArguments, range);
-        row.set_pattern_arguments_keyword_group(keywords);
-        row.set_pattern_arguments_positional_len(positional);
-        row.set_pattern_arguments_interleaved(u8::from(interleaved));
+        row.set_pattern_arguments_items(items);
         self.push(row)
     }
 }
 impl<'a> crate::PatternArguments<'a> {
     #[inline]
-    pub(super) fn ordered_items(self) -> NodeList<'a, crate::kind::Any> {
-        List::new(
-            self.syntax.ast,
-            super::ordered::argument_items(
-                self.syntax.row.pattern_arguments_keyword_group(),
-                self.syntax.row.pattern_arguments_positional_len(),
-                self.syntax.row.pattern_arguments_interleaved(),
-            ),
-        )
-    }
-    #[inline]
-    pub fn patterns(self) -> NodeList<'a, crate::kind::Pattern> {
-        let word = super::list::Interval::preceding(
-            self.syntax.row.pattern_arguments_keyword_group(),
-            u64::from(self.syntax.row.pattern_arguments_positional_len()),
-        );
-        List::new(self.syntax.ast, word)
-    }
-    #[inline]
-    pub fn keywords(self) -> NodeList<'a, crate::kind::PatternKeyword> {
-        let word = self.syntax.row.pattern_arguments_keyword_group();
+    pub fn items(self) -> List<'a, crate::PatternArgumentId> {
+        let word = self.syntax.row.pattern_arguments_items();
         List::new(self.syntax.ast, word)
     }
 }
@@ -4239,8 +4208,7 @@ impl std::fmt::Debug for crate::Arguments<'_> {
         f.debug_struct("Arguments")
             .field("range", &v.range())
             .field("node_index", &v.node_index())
-            .field("args", &v.args())
-            .field("keywords", &v.keywords())
+            .field("items", &v.items())
             .finish()
     }
 }
@@ -4249,47 +4217,17 @@ impl Builder {
     fn push_arguments(
         &mut self,
         range: ruff_text_size::TextRange,
-        [args, keywords]: [u64; 2],
-    ) -> BuildId<crate::kind::Arguments> {
-        let groups = self.ordered_argument_lists(args, keywords);
-        self.push_arguments_parts(range, groups)
-    }
-    #[inline]
-    fn push_arguments_parts(
-        &mut self,
-        range: ruff_text_size::TextRange,
-        (keywords, positional, interleaved): (u64, u32, bool),
+        [items]: [u64; 1],
     ) -> BuildId<crate::kind::Arguments> {
         let mut row = Row::new(NodeKind::Arguments, range);
-        row.set_arguments_keyword_group(keywords);
-        row.set_arguments_positional_len(positional);
-        row.set_arguments_interleaved(u8::from(interleaved));
+        row.set_arguments_items(items);
         self.push(row)
     }
 }
 impl<'a> crate::Arguments<'a> {
     #[inline]
-    pub(super) fn ordered_items(self) -> NodeList<'a, crate::kind::Any> {
-        List::new(
-            self.syntax.ast,
-            super::ordered::argument_items(
-                self.syntax.row.arguments_keyword_group(),
-                self.syntax.row.arguments_positional_len(),
-                self.syntax.row.arguments_interleaved(),
-            ),
-        )
-    }
-    #[inline]
-    pub fn args(self) -> NodeList<'a, crate::kind::Expr> {
-        let word = super::list::Interval::preceding(
-            self.syntax.row.arguments_keyword_group(),
-            u64::from(self.syntax.row.arguments_positional_len()),
-        );
-        List::new(self.syntax.ast, word)
-    }
-    #[inline]
-    pub fn keywords(self) -> NodeList<'a, crate::kind::Keyword> {
-        let word = self.syntax.row.arguments_keyword_group();
+    pub fn items(self) -> List<'a, crate::ArgumentId> {
+        let word = self.syntax.row.arguments_items();
         List::new(self.syntax.ast, word)
     }
 }
@@ -4308,11 +4246,7 @@ impl std::fmt::Debug for crate::Parameters<'_> {
         f.debug_struct("Parameters")
             .field("range", &v.range())
             .field("node_index", &v.node_index())
-            .field("posonlyargs", &v.posonlyargs())
-            .field("args", &v.args())
-            .field("vararg", &v.vararg())
-            .field("kwonlyargs", &v.kwonlyargs())
-            .field("kwarg", &v.kwarg())
+            .field("items", &v.items())
             .finish()
     }
 }
@@ -4321,40 +4255,18 @@ impl Builder {
     fn push_parameters(
         &mut self,
         range: ruff_text_size::TextRange,
-        [posonlyargs, args, vararg, kwonlyargs, kwarg]: [u64; 5],
+        [items]: [u64; 1],
     ) -> BuildId<crate::kind::Parameters> {
-        self.parameters_from_groups(range, [posonlyargs, args, vararg, kwonlyargs, kwarg])
+        let mut row = Row::new(NodeKind::Parameters, range);
+        row.set_parameters_items(items);
+        self.push(row)
     }
 }
 impl<'a> crate::Parameters<'a> {
     #[inline]
-    pub(super) fn ordered_items(self) -> NodeList<'a, crate::kind::Any> {
-        List::new(self.syntax.ast, self.syntax.row.parameters_items())
-    }
-    #[inline]
-    pub fn posonlyargs(self) -> NodeList<'a, crate::kind::ParameterWithDefault> {
-        let word = self.parameter_group::<0>();
-        List::new(self.syntax.ast, word)
-    }
-    #[inline]
-    pub fn args(self) -> NodeList<'a, crate::kind::ParameterWithDefault> {
-        let word = self.parameter_group::<1>();
-        List::new(self.syntax.ast, word)
-    }
-    #[inline]
-    pub fn vararg(self) -> Option<crate::Parameter<'a>> {
-        let word = self.variadic_parameter::<false>();
-        self.syntax.ast.optional_child(word)
-    }
-    #[inline]
-    pub fn kwonlyargs(self) -> NodeList<'a, crate::kind::ParameterWithDefault> {
-        let word = self.parameter_group::<2>();
-        List::new(self.syntax.ast, word)
-    }
-    #[inline]
-    pub fn kwarg(self) -> Option<crate::Parameter<'a>> {
-        let word = self.variadic_parameter::<true>();
-        self.syntax.ast.optional_child(word)
+    pub fn items(self) -> crate::flat::ParameterItems<'a> {
+        let word = self.syntax.row.parameters_items();
+        super::ParameterItems(List::new(self.syntax.ast, word))
     }
 }
 impl NodeType for crate::kind::Parameter {
@@ -5675,21 +5587,20 @@ impl Builder {
             .emit(self)
             .0
             .cast(),
-            AnyNode::PatternArguments(node) => {
-                let first = self.map_list(node.patterns(), |b, child| b.copy_with(child, rewriter));
-                let second =
-                    self.map_list(node.keywords(), |b, child| b.copy_with(child, rewriter));
-                let template = (node.syntax.row.pattern_arguments_interleaved() != 0)
-                    .then(|| node.ordered_items());
-                let groups = self.copy_argument_order(
-                    first.word(),
-                    second.word(),
-                    template,
-                    NodeKind::PatternKeyword,
-                );
-                self.push_pattern_arguments_parts(node.range(), groups)
-                    .cast()
+            AnyNode::PatternArguments(node) => build::PatternArguments {
+                range: node.range(),
+                items: self.map_list(node.items(), |b, item| match item {
+                    crate::PatternOrKeyword::Pattern(v) => {
+                        crate::PatternOrKeyword::Pattern(b.copy_with(v, rewriter))
+                    }
+                    crate::PatternOrKeyword::Keyword(v) => {
+                        crate::PatternOrKeyword::Keyword(b.copy_with(v, rewriter))
+                    }
+                }),
             }
+            .emit(self)
+            .0
+            .cast(),
             AnyNode::PatternKeyword(node) => build::PatternKeyword {
                 range: node.range(),
                 attr: self.copy_with(node.attr(), rewriter),
@@ -5708,29 +5619,23 @@ impl Builder {
             .emit(self)
             .0
             .cast(),
-            AnyNode::Arguments(node) => {
-                let first = self.map_list(node.args(), |b, child| b.copy_with(child, rewriter));
-                let second =
-                    self.map_list(node.keywords(), |b, child| b.copy_with(child, rewriter));
-                let template =
-                    (node.syntax.row.arguments_interleaved() != 0).then(|| node.ordered_items());
-                let groups = self.copy_argument_order(
-                    first.word(),
-                    second.word(),
-                    template,
-                    NodeKind::Keyword,
-                );
-                self.push_arguments_parts(node.range(), groups).cast()
+            AnyNode::Arguments(node) => build::Arguments {
+                range: node.range(),
+                items: self.map_list(node.items(), |b, item| match item {
+                    super::ArgOrKeyword::Arg(v) => {
+                        super::ArgumentId::Positional(b.copy_with(v, rewriter))
+                    }
+                    super::ArgOrKeyword::Keyword(v) => {
+                        super::ArgumentId::Keyword(b.copy_with(v, rewriter))
+                    }
+                }),
             }
+            .emit(self)
+            .0
+            .cast(),
             AnyNode::Parameters(node) => build::Parameters {
                 range: node.range(),
-                posonlyargs: self
-                    .map_list(node.posonlyargs(), |b, child| b.copy_with(child, rewriter)),
-                args: self.map_list(node.args(), |b, child| b.copy_with(child, rewriter)),
-                vararg: node.vararg().map(|child| self.copy_with(child, rewriter)),
-                kwonlyargs: self
-                    .map_list(node.kwonlyargs(), |b, child| b.copy_with(child, rewriter)),
-                kwarg: node.kwarg().map(|child| self.copy_with(child, rewriter)),
+                items: node.items().copy_to(self, rewriter),
             }
             .emit(self)
             .0
@@ -6698,8 +6603,11 @@ impl<'a> crate::PatternArguments<'a> {
         visitor: &mut (impl super::visitor::source_order::SourceOrderVisitor<'a> + ?Sized),
     ) {
         let node = self;
-        for child in node.children() {
-            child.dispatch(visitor);
+        for argument in node.items() {
+            match argument {
+                crate::PatternOrKeyword::Pattern(pattern) => visitor.visit_pattern(pattern),
+                crate::PatternOrKeyword::Keyword(keyword) => visitor.visit_pattern_keyword(keyword),
+            }
         }
     }
 }
@@ -6735,20 +6643,10 @@ impl<'a> crate::Arguments<'a> {
         visitor: &mut (impl super::visitor::source_order::SourceOrderVisitor<'a> + ?Sized),
     ) {
         let node = self;
-        if node.keywords().is_empty() {
-            for arg in node.args() {
-                visitor.visit_expr(arg);
-            }
-        } else if node.args().is_empty() {
-            for keyword in node.keywords() {
-                visitor.visit_keyword(keyword);
-            }
-        } else {
-            for argument in node.iter_source_order() {
-                match argument {
-                    super::ArgOrKeyword::Arg(expr) => visitor.visit_expr(expr),
-                    super::ArgOrKeyword::Keyword(keyword) => visitor.visit_keyword(keyword),
-                }
+        for argument in node.items() {
+            match argument {
+                super::ArgOrKeyword::Arg(expr) => visitor.visit_expr(expr),
+                super::ArgOrKeyword::Keyword(keyword) => visitor.visit_keyword(keyword),
             }
         }
     }
@@ -6760,19 +6658,12 @@ impl<'a> crate::Parameters<'a> {
         visitor: &mut (impl super::visitor::source_order::SourceOrderVisitor<'a> + ?Sized),
     ) {
         let node = self;
-        if node.has_only_regular_args() {
-            for parameter in node.ordered_items() {
-                let parameter = parameter.retype::<crate::ParameterWithDefault>();
-                visitor.visit_parameter_with_default(parameter);
-            }
-        } else {
-            for parameter in node.iter_source_order() {
-                match parameter {
-                    super::AnyParameter::NonVariadic(node) => {
-                        visitor.visit_parameter_with_default(node);
-                    }
-                    super::AnyParameter::Variadic(node) => visitor.visit_parameter(node),
+        for parameter in node.iter_source_order() {
+            match parameter {
+                super::AnyParameter::NonVariadic(node) => {
+                    visitor.visit_parameter_with_default(node);
                 }
+                super::AnyParameter::Variadic(node) => visitor.visit_parameter(node),
             }
         }
     }
@@ -9656,17 +9547,15 @@ pub mod build {
     #[derive(Debug)]
     pub struct PatternArguments {
         pub range: ruff_text_size::TextRange,
-        pub patterns: super::super::ListId<AstNodeId<crate::kind::Pattern>>,
-        pub keywords: super::super::ListId<AstNodeId<crate::kind::PatternKeyword>>,
+        pub items: super::super::ListId<crate::PatternArgumentId>,
     }
     impl Emit for PatternArguments {
         type Output = crate::kind::PatternArguments;
         #[inline]
         fn emit(self, builder: &mut Builder) -> EmittedNode<Self::Output> {
-            let patterns = self.patterns.word();
-            let keywords = self.keywords.word();
+            let items = self.items.word();
             (
-                builder.push_pattern_arguments(self.range, [patterns, keywords]),
+                builder.push_pattern_arguments(self.range, [items]),
                 self.range,
                 crate::NodeKind::PatternArguments,
             )
@@ -9717,17 +9606,15 @@ pub mod build {
     #[derive(Debug)]
     pub struct Arguments {
         pub range: ruff_text_size::TextRange,
-        pub args: super::super::ListId<AstNodeId<crate::kind::Expr>>,
-        pub keywords: super::super::ListId<AstNodeId<crate::kind::Keyword>>,
+        pub items: super::super::ListId<crate::ArgumentId>,
     }
     impl Emit for Arguments {
         type Output = crate::kind::Arguments;
         #[inline]
         fn emit(self, builder: &mut Builder) -> EmittedNode<Self::Output> {
-            let args = self.args.word();
-            let keywords = self.keywords.word();
+            let items = self.items.word();
             (
-                builder.push_arguments(self.range, [args, keywords]),
+                builder.push_arguments(self.range, [items]),
                 self.range,
                 crate::NodeKind::Arguments,
             )
@@ -9736,23 +9623,15 @@ pub mod build {
     #[derive(Debug, Default)]
     pub struct Parameters {
         pub range: ruff_text_size::TextRange,
-        pub posonlyargs: super::super::ListId<AstNodeId<crate::kind::ParameterWithDefault>>,
-        pub args: super::super::ListId<AstNodeId<crate::kind::ParameterWithDefault>>,
-        pub vararg: Option<BuildId<crate::kind::Parameter>>,
-        pub kwonlyargs: super::super::ListId<AstNodeId<crate::kind::ParameterWithDefault>>,
-        pub kwarg: Option<BuildId<crate::kind::Parameter>>,
+        pub items: super::super::ParameterItemsId,
     }
     impl Emit for Parameters {
         type Output = crate::kind::Parameters;
         #[inline]
         fn emit(self, builder: &mut Builder) -> EmittedNode<Self::Output> {
-            let posonlyargs = self.posonlyargs.word();
-            let args = self.args.word();
-            let vararg = self.vararg.map_or(0, |id| u64::from(id.slot));
-            let kwonlyargs = self.kwonlyargs.word();
-            let kwarg = self.kwarg.map_or(0, |id| u64::from(id.slot));
+            let items = self.items.word();
             (
-                builder.push_parameters(self.range, [posonlyargs, args, vararg, kwonlyargs, kwarg]),
+                builder.push_parameters(self.range, [items]),
                 self.range,
                 crate::NodeKind::Parameters,
             )
@@ -11397,8 +11276,7 @@ pub(crate) mod fields {
     pub struct PatternArgumentsFields<'a> {
         pub node: crate::PatternArguments<'a>,
         pub range: ruff_text_size::TextRange,
-        pub patterns: NodeList<'a, crate::kind::Pattern>,
-        pub keywords: NodeList<'a, crate::kind::PatternKeyword>,
+        pub items: List<'a, crate::PatternArgumentId>,
     }
     impl<'a> crate::PatternArguments<'a> {
         #[inline]
@@ -11406,8 +11284,7 @@ pub(crate) mod fields {
             PatternArgumentsFields {
                 node: self,
                 range: self.range(),
-                patterns: self.patterns(),
-                keywords: self.keywords(),
+                items: self.items(),
             }
         }
     }
@@ -11455,8 +11332,7 @@ pub(crate) mod fields {
     pub struct ArgumentsFields<'a> {
         pub node: crate::Arguments<'a>,
         pub range: ruff_text_size::TextRange,
-        pub args: NodeList<'a, crate::kind::Expr>,
-        pub keywords: NodeList<'a, crate::kind::Keyword>,
+        pub items: List<'a, crate::ArgumentId>,
     }
     impl<'a> crate::Arguments<'a> {
         #[inline]
@@ -11464,8 +11340,7 @@ pub(crate) mod fields {
             ArgumentsFields {
                 node: self,
                 range: self.range(),
-                args: self.args(),
-                keywords: self.keywords(),
+                items: self.items(),
             }
         }
     }
@@ -11473,11 +11348,7 @@ pub(crate) mod fields {
     pub struct ParametersFields<'a> {
         pub node: crate::Parameters<'a>,
         pub range: ruff_text_size::TextRange,
-        pub posonlyargs: NodeList<'a, crate::kind::ParameterWithDefault>,
-        pub args: NodeList<'a, crate::kind::ParameterWithDefault>,
-        pub vararg: Option<crate::Parameter<'a>>,
-        pub kwonlyargs: NodeList<'a, crate::kind::ParameterWithDefault>,
-        pub kwarg: Option<crate::Parameter<'a>>,
+        pub items: crate::flat::ParameterItems<'a>,
     }
     impl<'a> crate::Parameters<'a> {
         #[inline]
@@ -11485,11 +11356,7 @@ pub(crate) mod fields {
             ParametersFields {
                 node: self,
                 range: self.range(),
-                posonlyargs: self.posonlyargs(),
-                args: self.args(),
-                vararg: self.vararg(),
-                kwonlyargs: self.kwonlyargs(),
-                kwarg: self.kwarg(),
+                items: self.items(),
             }
         }
     }
@@ -14908,7 +14775,7 @@ pub(super) fn same_fields(left: SyntaxNode<'_>, right: SyntaxNode<'_>) -> bool {
         }
         AnyNode::PatternArguments(left) => {
             let right = right.retype::<crate::PatternArguments>();
-            left.patterns() == right.patterns() && left.keywords() == right.keywords()
+            left.items() == right.items()
         }
         AnyNode::PatternKeyword(left) => {
             let right = right.retype::<crate::PatternKeyword>();
@@ -14923,15 +14790,11 @@ pub(super) fn same_fields(left: SyntaxNode<'_>, right: SyntaxNode<'_>) -> bool {
         }
         AnyNode::Arguments(left) => {
             let right = right.retype::<crate::Arguments>();
-            left.args() == right.args() && left.keywords() == right.keywords()
+            left.items() == right.items()
         }
         AnyNode::Parameters(left) => {
             let right = right.retype::<crate::Parameters>();
-            left.posonlyargs() == right.posonlyargs()
-                && left.args() == right.args()
-                && left.vararg() == right.vararg()
-                && left.kwonlyargs() == right.kwonlyargs()
-                && left.kwarg() == right.kwarg()
+            left.items() == right.items()
         }
         AnyNode::Parameter(left) => {
             let right = right.retype::<crate::Parameter>();

@@ -149,6 +149,23 @@ def _():
     reveal_type(assert_never(0))  # error: [type-assertion-failure]
 ```
 
+## Argument type context
+
+`assert_never` infers its argument without providing type context. A call to `next` therefore
+retains the iterator's element type.
+
+```py
+from collections.abc import Iterator
+from typing import Never, assert_never
+
+def _(items: Iterator[Never]):
+    assert_never(next(items))  # ok
+
+def _(items: Iterator[int]):
+    # error: [type-assertion-failure] "Type `int` is not equivalent to `Never`"
+    assert_never(next(items))
+```
+
 ## Use case: Type narrowing and exhaustiveness checking
 
 ```toml

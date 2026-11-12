@@ -1915,9 +1915,16 @@ with a subtype (`bool`). In the case below, `Reader()` can be inferred as `Reade
 valid argument to the `self: Reader[int]` parameter, again due to covariance.
 
 ```py
-# TODO: this should not be an error, and Reader[bool] should be inferred (see https://github.com/astral-sh/ty/issues/4993)
-# revealed: Reader[int]
-narrow_reader: Reader[bool] = reveal_type(Reader())  # error: [invalid-assignment]
+# revealed: Reader[bool]
+narrow_reader: Reader[bool] = reveal_type(Reader())
+```
+
+It even works for a disjoint specialization type (`str`). Here, `Reader[Never]` is a subtype of
+`Reader[str]` and `Reader[int]`, and so this is a valid call:
+
+```py
+# revealed: Reader[Never]
+disjoint_reader: Reader[str] = reveal_type(Reader())
 ```
 
 The same is also true if the receiver is annotated with a union:
